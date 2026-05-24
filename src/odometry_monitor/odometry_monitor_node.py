@@ -403,7 +403,7 @@ class OdometryMonitor:
             self.info_axis.text(
                 0.05,  # 标签列的 x 坐标。
                 y,
-                label,
+                "{}:".format(label),
                 transform=self.info_axis.transAxes,
                 ha="left",
                 va="top",
@@ -412,7 +412,7 @@ class OdometryMonitor:
             )
             # 内容值
             self.info_axis.text(
-                0.35,  # 数值列的 x 坐标。
+                0.25,  # 数值列的 x 坐标。
                 y,
                 value,
                 transform=self.info_axis.transAxes,
