@@ -5,6 +5,7 @@
     pkg="odometry_monitor"
     type="odometry_monitor_node.py"
     name="odometry_monitor"
+    required="true"
     output="screen">
     <param name="odom_topic" value="$(arg odom_topic)" />
   </node>
