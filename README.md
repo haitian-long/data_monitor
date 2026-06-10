@@ -15,6 +15,10 @@ ROS Noetic 下的 odometry 实时监控工具。节点订阅 `nav_msgs/Odometry`
   - 点击后以当前 odometry 位置作为新的起点
   - 清空旧轨迹并重新绘制
   - 重新统计 `x`、`y`、`z` 波动范围
+- 提供 `Pause` 按钮
+  - 点击后暂停追加轨迹点，图和波动范围保持不变
+  - 暂停后可使用 Matplotlib 工具栏缩放、平移查看轨迹
+  - 再次点击 `Resume` 后继续绘图
 
 ## 依赖
 

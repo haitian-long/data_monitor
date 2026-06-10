@@ -23,6 +23,7 @@ class OdometryMonitor:
         # origin_pose 是 Reset 后的参考原点；latest_pose 是 odometry 原始 pose。
         self.latest_pose = None
         self.origin_pose = None
+        self.is_paused = False
 
         # 自上次 Reset 以来的相对 pose 历史。
         # position 单位为 m；rotation 为 roll/pitch/yaw，单位为 degree。
@@ -47,8 +48,8 @@ class OdometryMonitor:
         self.figure.subplots_adjust(left=0.06, bottom=0.18, right=0.58)
 
         # 主图中的 X-Y 轨迹对象，FuncAnimation 会原地更新它们。
-        (self.path_line,) = self.axis.plot([], [], color="#2563eb", linewidth=2.0)
-        (self.current_point,) = self.axis.plot([], [], "o", color="#dc2626", markersize=7)
+        (self.path_line,) = self.axis.plot([], [], color="#2563eb", linewidth=1.2)
+        (self.current_point,) = self.axis.plot([], [], "o", color="#dc2626", markersize=4)
 
         self.axis.set_title("Odometry X-Y Trace")
         self.axis.set_xlabel("X relative to reset origin (m)")
@@ -65,7 +66,7 @@ class OdometryMonitor:
         self.info_axis.set_ylim(0.0, 1.0)
         self._render_waiting_panel()
 
-        # Reset 按钮：[left, bottom, width, height]，坐标基于整个 figure。
+        # 控制按钮：[left, bottom, width, height]，坐标基于整个 figure。
         reset_axis = self.figure.add_axes([0.555, 0.04, 0.18, 0.06])
         self.reset_button = Button(
             reset_axis,
@@ -73,14 +74,18 @@ class OdometryMonitor:
             color="#2563eb",
             hovercolor="#1d4ed8",
         )
-        reset_axis.set_facecolor("#2563eb")
-        for spine in reset_axis.spines.values():
-            spine.set_color("#1e40af")
-            spine.set_linewidth(2.0)
-        self.reset_button.label.set_color("#ffffff")
-        self.reset_button.label.set_fontsize(10)
-        self.reset_button.label.set_fontweight("bold")
+        self._style_button(reset_axis, self.reset_button, "#2563eb", "#1e40af")
         self.reset_button.on_clicked(self._reset_clicked)
+
+        pause_axis = self.figure.add_axes([0.75, 0.04, 0.18, 0.06])
+        self.pause_button = Button(
+            pause_axis,
+            "Pause",
+            color="#f59e0b",
+            hovercolor="#d97706",
+        )
+        self._style_button(pause_axis, self.pause_button, "#f59e0b", "#b45309")
+        self.pause_button.on_clicked(self._pause_clicked)
 
         self.animation = FuncAnimation(
             self.figure,
@@ -97,6 +102,9 @@ class OdometryMonitor:
             if self.origin_pose is None:
                 # 第一次收到 odometry 时，自动把当前 pose 作为相对 pose 原点。
                 self.origin_pose = absolute_pose
+
+            if self.is_paused:
+                return
 
             relative_position = self._relative_position(absolute_pose[0])
             relative_rpy = self._relative_rpy_degrees(absolute_pose[1])
@@ -196,6 +204,17 @@ class OdometryMonitor:
             self.pitch_values = [0.0]
             self.yaw_values = [0.0]
 
+    def _pause_clicked(self, _event):
+        with self.lock:
+            self.is_paused = not self.is_paused
+            is_paused = self.is_paused
+
+        if is_paused:
+            self.pause_button.label.set_text("Resume")
+        else:
+            self.pause_button.label.set_text("Pause")
+        self.figure.canvas.draw_idle()
+
     def _snapshot(self):
         with self.lock:
             # 返回列表副本，避免绘图过程中长时间持有 lock。
@@ -207,12 +226,20 @@ class OdometryMonitor:
                 list(self.pitch_values),
                 list(self.yaw_values),
                 self.latest_pose,
+                self.is_paused,
             )
 
     def _update_plot(self, _frame):
-        x_values, y_values, z_values, roll_values, pitch_values, yaw_values, latest_pose = (
-            self._snapshot()
-        )
+        (
+            x_values,
+            y_values,
+            z_values,
+            roll_values,
+            pitch_values,
+            yaw_values,
+            latest_pose,
+            is_paused,
+        ) = self._snapshot()
 
         if rospy.is_shutdown():
             plt.close(self.figure)
@@ -225,7 +252,8 @@ class OdometryMonitor:
         # 使用快照更新轨迹，并重绘右侧信息面板。
         self.path_line.set_data(x_values, y_values)
         self.current_point.set_data([x_values[-1]], [y_values[-1]])
-        self._rescale_axis(x_values, y_values)
+        if not is_paused:
+            self._rescale_axis(x_values, y_values)
         self._render_info_panel(
             x_values,
             y_values,
@@ -234,6 +262,7 @@ class OdometryMonitor:
             pitch_values,
             yaw_values,
             latest_pose,
+            is_paused,
         )
 
         return self.path_line, self.current_point, self.info_axis
@@ -282,6 +311,7 @@ class OdometryMonitor:
         pitch_values,
         yaw_values,
         latest_pose,
+        is_paused,
     ):
         self.info_axis.clear()
         self.info_axis.set_axis_off()
@@ -304,22 +334,23 @@ class OdometryMonitor:
                     "Source",
                     [
                         ("Topic", self.odom_topic),
+                        ("Status", "Paused" if is_paused else "Running"),
                         ("Samples", "{}".format(len(x_values))),
                     ],
                 ),
                 (
                     "Relative Pose",
                     [
-                        ("position (m)", self._format_vector(current_position, 4)),
+                        ("position (m)", self._format_vector(current_position, 3)),
                         ("rotation (deg)", self._format_vector(current_rpy, 2)),
                     ],
                 ),
                 (
                     "Fluctuation Range",
                     [
-                        ("x (m)", self._format_range(x_values, 4)),
-                        ("y (m)", self._format_range(y_values, 4)),
-                        ("z (m)", self._format_range(z_values, 4)),
+                        ("x (m)", self._format_range(x_values, 3)),
+                        ("y (m)", self._format_range(y_values, 3)),
+                        ("z (m)", self._format_range(z_values, 3)),
                         ("roll (deg)", self._format_range(roll_values, 2)),
                         ("pitch (deg)", self._format_range(pitch_values, 2)),
                         ("yaw (deg)", self._format_range(yaw_values, 2)),
@@ -328,12 +359,21 @@ class OdometryMonitor:
                 (
                     "Latest Absolute Pose",
                     [
-                        ("position (m)", self._format_vector(latest_position, 4)),
+                        ("position (m)", self._format_vector(latest_position, 3)),
                         ("rotation (deg)", self._format_vector(latest_rpy, 2)),
                     ],
                 ),
             ]
         )
+
+    def _style_button(self, axis, button, facecolor, spine_color):
+        axis.set_facecolor(facecolor)
+        for spine in axis.spines.values():
+            spine.set_color(spine_color)
+            spine.set_linewidth(2.0)
+        button.label.set_color("#ffffff")
+        button.label.set_fontsize(10)
+        button.label.set_fontweight("bold")
 
     def _draw_cards(self, cards):
         # 自动布局参数均为右侧信息面板的归一化坐标。
