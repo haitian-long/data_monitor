@@ -1,4 +1,4 @@
-# odometry_monitor
+# data_monitor
 
 ROS Noetic 下的 odometry 实时监控工具。节点订阅 `nav_msgs/Odometry`，打开 Matplotlib 窗口，将 odometry 的 `x`、`y` 坐标绘制到二维直角坐标系中，并实时显示相对当前起点的 pose 和 `x`、`y`、`z` 相对位置波动范围。
 
@@ -36,19 +36,19 @@ source devel/setup.bash
 使用默认 `/odom` 话题：
 
 ```bash
-roslaunch odometry_monitor odometry_monitor.launch
+roslaunch data_monitor odometry_monitor.launch
 ```
 
 指定其他 odometry 话题：
 
 ```bash
-roslaunch odometry_monitor odometry_monitor.launch odom_topic:=/your/odom/topic
+roslaunch data_monitor odometry_monitor.launch odom_topic:=/your/odom/topic
 ```
 
 也可以直接运行节点：
 
 ```bash
-rosrun odometry_monitor odometry_monitor_node.py _odom_topic:=/odom
+rosrun data_monitor odometry_monitor_node.py _odom_topic:=/odom
 ```
 
 ## 说明
