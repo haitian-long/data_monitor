@@ -1,4 +1,4 @@
-# odometry_monitor
+# data_monitor
 
 ROS 2 下的 odometry 实时监控工具。节点订阅 `nav_msgs/Odometry`，打开 Matplotlib 窗口，将 odometry 的 `x`、`y` 坐标绘制到二维直角坐标系中，并实时显示相对当前起点的 pose 和 `x`、`y`、`z` 相对位置波动范围。
 
@@ -27,7 +27,7 @@ sudo apt install ros-${ROS_DISTRO}-nav-msgs python3-matplotlib
 在工作空间根目录执行：
 
 ```bash
-colcon build --packages-select odometry_monitor
+colcon build --packages-select data_monitor
 source install/setup.bash
 ```
 
@@ -36,19 +36,19 @@ source install/setup.bash
 使用默认 `/odom` 话题：
 
 ```bash
-ros2 launch odometry_monitor odometry_monitor.launch.py
+ros2 launch data_monitor odometry_monitor.launch.py
 ```
 
 指定其他 odometry 话题：
 
 ```bash
-ros2 launch odometry_monitor odometry_monitor.launch.py odom_topic:=/your/odom/topic
+ros2 launch data_monitor odometry_monitor.launch.py odom_topic:=/your/odom/topic
 ```
 
 也可以直接运行节点：
 
 ```bash
-ros2 run odometry_monitor odometry_monitor --ros-args -p odom_topic:=/odom
+ros2 run data_monitor odometry_monitor --ros-args -p odom_topic:=/odom
 ```
 
 ## 说明

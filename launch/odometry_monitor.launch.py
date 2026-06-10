@@ -15,7 +15,7 @@ def generate_launch_description():
                 description="Odometry topic to monitor.",
             ),
             Node(
-                package="odometry_monitor",
+                package="data_monitor",
                 executable="odometry_monitor",
                 name="odometry_monitor",
                 output="screen",

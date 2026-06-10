@@ -5,7 +5,7 @@ import os
 
 from setuptools import find_packages, setup
 
-package_name = "odometry_monitor"
+package_name = "data_monitor"
 
 setup(
     name=package_name,
