@@ -11,7 +11,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument(
                 "odom_topic",
-                default_value="/robot/dlio/odom_node/odom",
+                default_value="/dlio/odom_node/odom",
                 description="Odometry topic to monitor.",
             ),
             Node(
