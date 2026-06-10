@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
 
-from distutils.core import setup
+from glob import glob
+import os
 
-from catkin_pkg.python_setup import generate_distutils_setup
+from setuptools import find_packages, setup
 
+package_name = "odometry_monitor"
 
-setup_args = generate_distutils_setup(
-    packages=["odometry_monitor"],
+setup(
+    name=package_name,
+    version="0.1.0",
+    packages=find_packages(where="src"),
     package_dir={"": "src"},
+    data_files=[
+        ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
+        ("share/" + package_name, ["package.xml"]),
+        (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
+    ],
+    install_requires=["setuptools"],
+    zip_safe=True,
+    maintainer="user",
+    maintainer_email="user@example.com",
+    description="Realtime odometry plotting and range monitoring tool.",
+    license="MIT",
+    tests_require=["pytest"],
+    entry_points={
+        "console_scripts": [
+            "odometry_monitor = odometry_monitor.odometry_monitor_node:main",
+        ],
+    },
 )
-
-setup(**setup_args)

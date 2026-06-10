@@ -1,6 +1,6 @@
 # odometry_monitor
 
-ROS Noetic 下的 odometry 实时监控工具。节点订阅 `nav_msgs/Odometry`，打开 Matplotlib 窗口，将 odometry 的 `x`、`y` 坐标绘制到二维直角坐标系中，并实时显示相对当前起点的 pose 和 `x`、`y`、`z` 相对位置波动范围。
+ROS 2 下的 odometry 实时监控工具。节点订阅 `nav_msgs/Odometry`，打开 Matplotlib 窗口，将 odometry 的 `x`、`y` 坐标绘制到二维直角坐标系中，并实时显示相对当前起点的 pose 和 `x`、`y`、`z` 相对位置波动范围。
 
 ## 功能
 
@@ -19,7 +19,7 @@ ROS Noetic 下的 odometry 实时监控工具。节点订阅 `nav_msgs/Odometry`
 ## 依赖
 
 ```bash
-sudo apt install ros-noetic-nav-msgs python3-matplotlib
+sudo apt install ros-${ROS_DISTRO}-nav-msgs python3-matplotlib
 ```
 
 ## 编译
@@ -27,8 +27,8 @@ sudo apt install ros-noetic-nav-msgs python3-matplotlib
 在工作空间根目录执行：
 
 ```bash
-catkin_make
-source devel/setup.bash
+colcon build --packages-select odometry_monitor
+source install/setup.bash
 ```
 
 ## 运行
@@ -36,19 +36,19 @@ source devel/setup.bash
 使用默认 `/odom` 话题：
 
 ```bash
-roslaunch odometry_monitor odometry_monitor.launch
+ros2 launch odometry_monitor odometry_monitor.launch.py
 ```
 
 指定其他 odometry 话题：
 
 ```bash
-roslaunch odometry_monitor odometry_monitor.launch odom_topic:=/your/odom/topic
+ros2 launch odometry_monitor odometry_monitor.launch.py odom_topic:=/your/odom/topic
 ```
 
 也可以直接运行节点：
 
 ```bash
-rosrun odometry_monitor odometry_monitor_node.py _odom_topic:=/odom
+ros2 run odometry_monitor odometry_monitor --ros-args -p odom_topic:=/odom
 ```
 
 ## 说明

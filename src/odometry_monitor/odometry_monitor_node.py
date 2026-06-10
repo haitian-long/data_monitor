@@ -8,12 +8,17 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button
 from nav_msgs.msg import Odometry
-import rospy
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
 
 
-class OdometryMonitor:
+class OdometryMonitor(Node):
     def __init__(self):
-        self.odom_topic = rospy.get_param("~odom_topic", "/odom")
+        super().__init__("odometry_monitor")
+
+        self.declare_parameter("odom_topic", "/odom")
+        self.odom_topic = self.get_parameter("odom_topic").value
 
         # ROS 订阅回调和 Matplotlib 动画刷新会从不同路径访问状态，
         # 因此用 lock 保护 pose 和历史数据。
@@ -33,11 +38,11 @@ class OdometryMonitor:
         self.pitch_values = []
         self.yaw_values = []
 
-        self.subscriber = rospy.Subscriber(
-            self.odom_topic,
+        self.subscriber = self.create_subscription(
             Odometry,
+            self.odom_topic,
             self._odometry_callback,
-            queue_size=50,
+            50,
         )
 
         self.figure, self.axis = plt.subplots(figsize=(13.5, 7))
@@ -214,7 +219,7 @@ class OdometryMonitor:
             self._snapshot()
         )
 
-        if rospy.is_shutdown():
+        if not rclpy.ok():
             plt.close(self.figure)
             return self.path_line, self.current_point, self.info_axis
 
@@ -432,14 +437,30 @@ class OdometryMonitor:
         return template.format(min(values), max(values))
 
     def show(self):
-        rospy.loginfo("Listening to odometry topic: %s", self.odom_topic)
+        self.get_logger().info("Listening to odometry topic: {}".format(self.odom_topic))
         plt.show()
 
 
-def main():
-    rospy.init_node("odometry_monitor")
+def _spin_node(node):
+    try:
+        rclpy.spin(node)
+    except ExternalShutdownException:
+        pass
+
+
+def main(args=None):
+    rclpy.init(args=args)
     monitor = OdometryMonitor()
-    monitor.show()
+    spin_thread = threading.Thread(target=_spin_node, args=(monitor,), daemon=True)
+    spin_thread.start()
+
+    try:
+        monitor.show()
+    finally:
+        monitor.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        spin_thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":
