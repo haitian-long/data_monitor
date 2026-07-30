@@ -1,9 +1,9 @@
 <launch>
-  <arg name="pcd_dir" default="$(env HOME)/disk/projects/ros1/fast_lio_ws/src/FAST_LIO_Hesai/PCD" />
-  <arg name="resolution" default="0.10" />
+  <arg name="pcd_dir" default="$(env HOME)/disk/projects/ros1/data_monitor/src/test_data" />
+  <arg name="voxel_size" default="0.10" />
+  <arg name="title" default="PCD BEV Monitor" />
   <arg name="recursive" default="false" />
   <arg name="colormap" default="turbo" />
-  <arg name="max_grid_cells" default="30000000" />
 
   <node
     pkg="data_monitor"
@@ -12,9 +12,9 @@
     required="true"
     output="screen">
     <param name="pcd_dir" value="$(arg pcd_dir)" />
-    <param name="resolution" value="$(arg resolution)" />
+    <param name="voxel_size" value="$(arg voxel_size)" />
+    <param name="title" value="$(arg title)" />
     <param name="recursive" value="$(arg recursive)" />
     <param name="colormap" value="$(arg colormap)" />
-    <param name="max_grid_cells" value="$(arg max_grid_cells)" />
   </node>
 </launch>

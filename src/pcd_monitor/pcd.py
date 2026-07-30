@@ -5,6 +5,11 @@ from pathlib import Path
 import numpy as np
 
 
+PCD_CHUNK_POINTS = 1000000
+VOXEL_MERGE_POINT_LIMIT = 4000000
+DISPLAY_Z_PERCENTILES = (1.0, 99.0)
+
+
 class PcdError(RuntimeError):
     pass
 
@@ -51,111 +56,334 @@ def read_pcd_xyz(path):
     return points
 
 
-def build_bev(pcd_files, resolution, max_grid_cells=16000000):
+def voxel_downsample(xyz, voxel_size):
     """
-    Rasterize all PCD files into one XY grid.
+    Keep one representative point per 3D voxel.
 
-    Each occupied pixel stores the maximum Z value of all points falling into it.
-    The return value is a dictionary containing the grid, its world extent and
-    useful statistics for the UI.
+    Voxel coordinates are packed into one uint64 key so memory usage stays much
+    lower than keeping an N x 3 int64 voxel-index array. The highest-Z source
+    point in each voxel is retained so BEV height maxima are preserved.
     """
-    if not math.isfinite(resolution) or resolution <= 0.0:
-        raise PcdError("BEV resolution must be a finite value greater than zero")
-    if max_grid_cells <= 0:
-        raise PcdError("max_grid_cells must be greater than zero")
+    voxel_size = float(voxel_size)
+    if not math.isfinite(voxel_size) or voxel_size <= 0.0:
+        raise PcdError("voxel_size must be a finite value greater than zero")
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise PcdError("Voxel input must have shape N x 3")
 
+    finite = np.isfinite(xyz).all(axis=1)
+    if not np.all(finite):
+        xyz = xyz[finite]
+    if xyz.shape[0] <= 1:
+        return xyz
+
+    max_uint64 = np.iinfo(np.uint64).max
+
+    voxel_x = _voxel_indices(xyz[:, 0], voxel_size)
+    min_voxel_x = int(np.min(voxel_x))
+    size_x = int(np.max(voxel_x)) - min_voxel_x + 1
+    keys = (voxel_x - min_voxel_x).astype(np.uint64)
+    del voxel_x
+
+    voxel_y = _voxel_indices(xyz[:, 1], voxel_size)
+    min_voxel_y = int(np.min(voxel_y))
+    size_y = int(np.max(voxel_y)) - min_voxel_y + 1
+    if size_x > max_uint64 // size_y:
+        raise PcdError("Voxel index range is too large; increase voxel_size")
+    keys += (voxel_y - min_voxel_y).astype(np.uint64) * np.uint64(size_x)
+    del voxel_y
+
+    xy_size = size_x * size_y
+    voxel_z = _voxel_indices(xyz[:, 2], voxel_size)
+    min_voxel_z = int(np.min(voxel_z))
+    size_z = int(np.max(voxel_z)) - min_voxel_z + 1
+    if xy_size > max_uint64 // size_z:
+        raise PcdError("Voxel index range is too large; increase voxel_size")
+    keys += (voxel_z - min_voxel_z).astype(np.uint64) * np.uint64(xy_size)
+    del voxel_z
+
+    # Sort primarily by voxel key and secondarily by descending Z. The first
+    # entry in each key group is therefore that voxel's highest source point.
+    order = np.lexsort((-xyz[:, 2].astype(np.float64, copy=False), keys))
+    sorted_keys = keys[order]
+    first_in_voxel = np.empty(sorted_keys.shape[0], dtype=bool)
+    first_in_voxel[0] = True
+    first_in_voxel[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    representative_indices = order[first_in_voxel]
+    if representative_indices.size == xyz.shape[0]:
+        return xyz
+    return xyz[representative_indices]
+
+
+def read_pcd_xyz_voxelized(path, voxel_size, chunk_points=PCD_CHUNK_POINTS):
+    """
+    Read a PCD in bounded chunks and return its voxel-filtered XYZ points.
+
+    ASCII and uncompressed binary payloads are streamed. binary_compressed must
+    still be decompressed as one block because that is how the PCD format stores
+    it, but it is voxel-filtered immediately afterward.
+    """
+    if (
+        isinstance(chunk_points, bool)
+        or not isinstance(chunk_points, int)
+        or chunk_points <= 0
+    ):
+        raise PcdError("chunk_points must be a positive integer")
+
+    path = Path(path)
+    try:
+        with path.open("rb") as stream:
+            header = _read_header(stream, path)
+            if header["data"] == "ascii":
+                chunks = _iter_ascii_xyz_chunks(
+                    stream,
+                    header,
+                    path,
+                    chunk_points,
+                )
+            elif header["data"] == "binary":
+                chunks = _iter_binary_xyz_chunks(
+                    stream,
+                    header,
+                    path,
+                    chunk_points,
+                )
+            elif header["data"] == "binary_compressed":
+                chunks = iter((_read_binary_compressed_xyz(stream, header, path),))
+            else:
+                raise PcdError(
+                    "Unsupported PCD DATA type '{}' in {}".format(header["data"], path)
+                )
+
+            sampled_chunks = []
+            buffered_points = 0
+            total_points = 0
+            finite_points = 0
+            for xyz in chunks:
+                total_points += int(xyz.shape[0])
+                finite_points += int(np.count_nonzero(np.isfinite(xyz).all(axis=1)))
+                sampled = voxel_downsample(xyz, voxel_size)
+                if sampled.size == 0:
+                    continue
+                sampled_chunks.append(sampled)
+                buffered_points += int(sampled.shape[0])
+                if buffered_points >= VOXEL_MERGE_POINT_LIMIT:
+                    sampled_chunks = [
+                        _merge_voxel_chunks(sampled_chunks, voxel_size)
+                    ]
+                    buffered_points = int(sampled_chunks[0].shape[0])
+    except OSError as error:
+        raise PcdError("Could not read {}: {}".format(path, error)) from error
+
+    sampled = _merge_voxel_chunks(sampled_chunks, voxel_size)
+    return sampled, total_points, finite_points
+
+
+def load_point_clouds(pcd_files, voxel_size):
+    """Read all PCD files once and return a cached voxel-filtered XYZ array."""
     files = [Path(path) for path in pcd_files]
     if not files:
         raise PcdError("No PCD files were provided")
 
-    min_x = min_y = min_z = math.inf
-    max_x = max_y = max_z = -math.inf
     total_points = 0
     finite_points = 0
+    sampled_clouds = []
 
-    # The first pass finds world bounds without retaining every cloud in memory.
+    # Each raw cloud is downsampled immediately. Only its compact sampled result
+    # is retained while the next file is processed.
     for path in files:
-        xyz = read_pcd_xyz(path)
-        total_points += int(xyz.shape[0])
-        valid = np.isfinite(xyz).all(axis=1)
-        xyz = xyz[valid]
-        finite_points += int(xyz.shape[0])
-        if xyz.size == 0:
-            continue
-        mins = np.min(xyz, axis=0)
-        maxs = np.max(xyz, axis=0)
-        min_x = min(min_x, float(mins[0]))
-        min_y = min(min_y, float(mins[1]))
-        min_z = min(min_z, float(mins[2]))
-        max_x = max(max_x, float(maxs[0]))
-        max_y = max(max_y, float(maxs[1]))
-        max_z = max(max_z, float(maxs[2]))
+        xyz, file_total_points, file_finite_points = read_pcd_xyz_voxelized(
+            path,
+            voxel_size,
+        )
+        total_points += file_total_points
+        finite_points += file_finite_points
+        if xyz.size:
+            sampled_clouds.append(xyz)
 
     if finite_points == 0:
         raise PcdError("The selected PCD files contain no finite XYZ points")
 
-    origin_x = math.floor(min_x / resolution) * resolution
-    origin_y = math.floor(min_y / resolution) * resolution
-    width = int(math.floor((max_x - origin_x) / resolution)) + 1
-    height = int(math.floor((max_y - origin_y) / resolution)) + 1
-    cell_count = width * height
-    if cell_count > max_grid_cells:
-        approximate_resolution = resolution * math.sqrt(
-            float(cell_count) / float(max_grid_cells)
-        )
-        raise PcdError(
-            "BEV grid would contain {:,} pixels ({} x {}), above the {:,} limit. "
-            "Increase ~resolution to about {:.4g} m/pixel or raise "
-            "~max_grid_cells.".format(
-                cell_count,
-                width,
-                height,
-                max_grid_cells,
-                approximate_resolution,
-            )
-        )
-
-    grid = np.full((height, width), -np.inf, dtype=np.float32)
-
-    # The second pass performs an in-place maximum reduction for each pixel.
-    for path in files:
-        xyz = read_pcd_xyz(path)
-        xyz = xyz[np.isfinite(xyz).all(axis=1)]
-        if xyz.size == 0:
-            continue
-
-        pixel_x = np.floor((xyz[:, 0] - origin_x) / resolution).astype(np.int64)
-        pixel_y = np.floor((xyz[:, 1] - origin_y) / resolution).astype(np.int64)
-        inside = (
-            (pixel_x >= 0)
-            & (pixel_x < width)
-            & (pixel_y >= 0)
-            & (pixel_y < height)
-        )
-        np.maximum.at(
-            grid,
-            (pixel_y[inside], pixel_x[inside]),
-            xyz[inside, 2].astype(np.float32, copy=False),
-        )
-
-    occupied = np.isfinite(grid)
-    extent = (
-        origin_x,
-        origin_x + width * resolution,
-        origin_y,
-        origin_y + height * resolution,
+    # Merge once more so overlapping PCD files also share one representative
+    # point per voxel. float32 keeps the persistent XYZ cache compact.
+    sampled_xyz = _merge_voxel_chunks(sampled_clouds, voxel_size)
+    sampled_xyz = np.ascontiguousarray(sampled_xyz, dtype=np.float32)
+    mins = np.min(sampled_xyz, axis=0)
+    maxs = np.max(sampled_xyz, axis=0)
+    display_z_min, display_z_max = np.percentile(
+        sampled_xyz[:, 2],
+        DISPLAY_Z_PERCENTILES,
     )
-    return {
-        "grid": grid,
-        "occupied": occupied,
-        "extent": extent,
-        "resolution": resolution,
+    stats = {
         "file_count": len(files),
         "total_points": total_points,
         "finite_points": finite_points,
-        "occupied_pixels": int(np.count_nonzero(occupied)),
-        "xyz_bounds": ((min_x, max_x), (min_y, max_y), (min_z, max_z)),
+        "sampled_points": int(sampled_xyz.shape[0]),
+        "cache_bytes": int(sampled_xyz.nbytes),
+        "voxel_size": float(voxel_size),
+        "display_z_percentiles": DISPLAY_Z_PERCENTILES,
+        "display_z_range": (float(display_z_min), float(display_z_max)),
+        "xyz_bounds": (
+            (float(mins[0]), float(maxs[0])),
+            (float(mins[1]), float(maxs[1])),
+            (float(mins[2]), float(maxs[2])),
+        ),
     }
+    return sampled_xyz, stats
+
+
+def extent_for_bounds(
+    x_bounds,
+    y_bounds,
+    aspect_ratio=16.0 / 9.0,
+    padding_ratio=0.02,
+):
+    """
+    Return a centered XY extent with the requested width/height aspect ratio.
+
+    Matching the world extent aspect ratio to the raster aspect ratio keeps X
+    and Y at the same physical resolution.
+    """
+    min_x, max_x = sorted((float(x_bounds[0]), float(x_bounds[1])))
+    min_y, max_y = sorted((float(y_bounds[0]), float(y_bounds[1])))
+    values = (min_x, max_x, min_y, max_y, aspect_ratio, padding_ratio)
+    if not all(math.isfinite(value) for value in values):
+        raise PcdError("BEV bounds, aspect ratio and padding must be finite")
+    if aspect_ratio <= 0.0:
+        raise PcdError("BEV aspect_ratio must be greater than zero")
+    if padding_ratio < 0.0:
+        raise PcdError("BEV padding_ratio must not be negative")
+
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    source_width = max_x - min_x
+    source_height = max_y - min_y
+    if source_width <= 0.0 and source_height <= 0.0:
+        # A cloud with one XY location still needs a useful non-zero view.
+        view_height = 1.0
+    else:
+        view_height = max(source_height, source_width / aspect_ratio)
+    view_width = view_height * aspect_ratio
+    scale = 1.0 + 2.0 * padding_ratio
+    half_width = view_width * scale / 2.0
+    half_height = view_height * scale / 2.0
+    return (
+        center_x - half_width,
+        center_x + half_width,
+        center_y - half_height,
+        center_y + half_height,
+    )
+
+
+def build_bev(
+    sampled_xyz,
+    extent,
+    grid_width=2560,
+    grid_height=1440,
+    dataset_stats=None,
+):
+    """
+    Rasterize cached sampled XYZ points into a fixed grid for the requested extent.
+
+    Each occupied pixel stores the maximum Z value of all points falling into it.
+    """
+    if sampled_xyz.ndim != 2 or sampled_xyz.shape[1] != 3:
+        raise PcdError("Cached sampled point cloud must have shape N x 3")
+    if sampled_xyz.shape[0] == 0:
+        raise PcdError("Cached sampled point cloud is empty")
+    if dataset_stats is None:
+        raise PcdError("dataset_stats are required to build a BEV")
+    if (
+        isinstance(grid_width, bool)
+        or not isinstance(grid_width, int)
+        or grid_width <= 0
+        or isinstance(grid_height, bool)
+        or not isinstance(grid_height, int)
+        or grid_height <= 0
+    ):
+        raise PcdError("BEV grid width and height must be positive integers")
+    if len(extent) != 4:
+        raise PcdError("BEV extent must contain min_x, max_x, min_y and max_y")
+
+    min_x, max_x, min_y, max_y = (float(value) for value in extent)
+    if not all(math.isfinite(value) for value in (min_x, max_x, min_y, max_y)):
+        raise PcdError("BEV extent values must be finite")
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    if span_x <= 0.0 or span_y <= 0.0:
+        raise PcdError("BEV extent must have positive X and Y spans")
+    extent_aspect = span_x / span_y
+    grid_aspect = float(grid_width) / float(grid_height)
+    if not math.isclose(
+        extent_aspect,
+        grid_aspect,
+        rel_tol=1e-9,
+        abs_tol=1e-12,
+    ):
+        raise PcdError(
+            "BEV extent aspect ratio must match the raster aspect ratio"
+        )
+
+    resolution = span_x / float(grid_width)
+    grid = np.full((grid_height, grid_width), -np.inf, dtype=np.float32)
+
+    # Points on the maximum boundary are included in the last row/column.
+    inside = (
+        (sampled_xyz[:, 0] >= min_x)
+        & (sampled_xyz[:, 0] <= max_x)
+        & (sampled_xyz[:, 1] >= min_y)
+        & (sampled_xyz[:, 1] <= max_y)
+    )
+    xyz = sampled_xyz[inside]
+    visible_points = int(xyz.shape[0])
+    if xyz.size:
+        pixel_x = np.floor((xyz[:, 0] - min_x) / resolution).astype(np.int64)
+        pixel_y = np.floor((xyz[:, 1] - min_y) / resolution).astype(np.int64)
+        pixel_x = np.clip(pixel_x, 0, grid_width - 1)
+        pixel_y = np.clip(pixel_y, 0, grid_height - 1)
+        np.maximum.at(
+            grid,
+            (pixel_y, pixel_x),
+            xyz[:, 2].astype(np.float32, copy=False),
+        )
+
+    occupied_pixels = int(np.count_nonzero(np.isfinite(grid)))
+    return {
+        "grid": grid,
+        "extent": (min_x, max_x, min_y, max_y),
+        "grid_width": grid_width,
+        "grid_height": grid_height,
+        "resolution": resolution,
+        "file_count": dataset_stats["file_count"],
+        "total_points": dataset_stats["total_points"],
+        "finite_points": dataset_stats["finite_points"],
+        "sampled_points": dataset_stats["sampled_points"],
+        "cache_bytes": dataset_stats["cache_bytes"],
+        "voxel_size": dataset_stats["voxel_size"],
+        "display_z_percentiles": dataset_stats["display_z_percentiles"],
+        "display_z_range": dataset_stats["display_z_range"],
+        "visible_points": visible_points,
+        "occupied_pixels": occupied_pixels,
+        "xyz_bounds": dataset_stats["xyz_bounds"],
+    }
+
+
+def _voxel_indices(values, voxel_size):
+    with np.errstate(over="ignore", invalid="ignore"):
+        scaled = np.floor(values / voxel_size)
+    if not np.isfinite(scaled).all():
+        raise PcdError("Voxel coordinates overflowed; increase voxel_size")
+    int64_info = np.iinfo(np.int64)
+    if np.min(scaled) < int64_info.min or np.max(scaled) > int64_info.max:
+        raise PcdError("Voxel coordinates exceed int64 range; increase voxel_size")
+    return scaled.astype(np.int64)
+
+
+def _merge_voxel_chunks(chunks, voxel_size):
+    if not chunks:
+        return np.empty((0, 3), dtype=np.float32)
+    if len(chunks) == 1:
+        return chunks[0]
+    return voxel_downsample(np.concatenate(chunks, axis=0), voxel_size)
 
 
 def _read_header(stream, path):
@@ -220,17 +448,11 @@ def _read_header(stream, path):
 
 
 def _read_ascii_xyz(stream, header, path):
-    field_columns = {}
-    column = 0
-    for name, count in zip(header["fields"], header["counts"]):
-        field_columns[name] = column
-        column += count
-    xyz_columns = tuple(field_columns[axis] for axis in ("x", "y", "z"))
-
+    xyz_columns = _ascii_xyz_columns(header)
     try:
         points = np.loadtxt(
             stream,
-            dtype=np.float64,
+            dtype=np.float32,
             comments="#",
             usecols=xyz_columns,
             ndmin=2,
@@ -239,11 +461,78 @@ def _read_ascii_xyz(stream, header, path):
         raise PcdError("Could not parse ASCII point data in {}: {}".format(path, error)) from error
 
     if points.size == 0:
-        return np.empty((0, 3), dtype=np.float64)
+        return np.empty((0, 3), dtype=np.float32)
     return points
 
 
+def _iter_ascii_xyz_chunks(stream, header, path, chunk_points):
+    xyz_columns = _ascii_xyz_columns(header)
+    remaining = header["points"]
+    while remaining > 0:
+        requested = min(remaining, chunk_points)
+        try:
+            points = np.loadtxt(
+                stream,
+                dtype=np.float32,
+                comments="#",
+                usecols=xyz_columns,
+                ndmin=2,
+                max_rows=requested,
+            )
+        except (ValueError, IndexError) as error:
+            raise PcdError(
+                "Could not parse ASCII point data in {}: {}".format(path, error)
+            ) from error
+        if points.shape[0] == 0:
+            raise PcdError(
+                "ASCII payload in {} ended before its declared POINTS count".format(path)
+            )
+        remaining -= int(points.shape[0])
+        yield points
+
+
+def _ascii_xyz_columns(header):
+    field_columns = {}
+    column = 0
+    for name, count in zip(header["fields"], header["counts"]):
+        field_columns[name] = column
+        column += count
+    return tuple(field_columns[axis] for axis in ("x", "y", "z"))
+
+
 def _read_binary_xyz(stream, header, path):
+    point_dtype, safe_names = _binary_layout(header, path)
+    expected_size = header["points"] * point_dtype.itemsize
+    data = stream.read(expected_size)
+    if len(data) != expected_size:
+        raise PcdError(
+            "Binary payload in {} is {} bytes; expected {}".format(
+                path, len(data), expected_size
+            )
+        )
+
+    records = np.frombuffer(data, dtype=point_dtype, count=header["points"])
+    return _binary_records_xyz(records, header, safe_names)
+
+
+def _iter_binary_xyz_chunks(stream, header, path, chunk_points):
+    point_dtype, safe_names = _binary_layout(header, path)
+    remaining = header["points"]
+    while remaining > 0:
+        point_count = min(remaining, chunk_points)
+        expected_size = point_count * point_dtype.itemsize
+        data = stream.read(expected_size)
+        if len(data) != expected_size:
+            raise PcdError(
+                "Binary payload in {} is {} bytes short of its declared "
+                "POINTS count".format(path, expected_size - len(data))
+            )
+        records = np.frombuffer(data, dtype=point_dtype, count=point_count)
+        yield _binary_records_xyz(records, header, safe_names)
+        remaining -= point_count
+
+
+def _binary_layout(header, path):
     dtype_fields = []
     safe_names = []
     for index, (name, size, data_type, count) in enumerate(
@@ -261,25 +550,17 @@ def _read_binary_xyz(stream, header, path):
             dtype_fields.append((safe_name, scalar_dtype))
         else:
             dtype_fields.append((safe_name, scalar_dtype, (count,)))
+    return np.dtype(dtype_fields), safe_names
 
-    point_dtype = np.dtype(dtype_fields)
-    expected_size = header["points"] * point_dtype.itemsize
-    data = stream.read(expected_size)
-    if len(data) != expected_size:
-        raise PcdError(
-            "Binary payload in {} is {} bytes; expected {}".format(
-                path, len(data), expected_size
-            )
-        )
 
-    records = np.frombuffer(data, dtype=point_dtype, count=header["points"])
+def _binary_records_xyz(records, header, safe_names):
     columns = []
     for axis in ("x", "y", "z"):
         field_index = header["fields"].index(axis)
         values = records[safe_names[field_index]]
         if values.ndim > 1:
             values = values[:, 0]
-        columns.append(values.astype(np.float64, copy=False))
+        columns.append(values)
     return np.column_stack(columns)
 
 
@@ -319,7 +600,7 @@ def _read_binary_compressed_xyz(stream, header, path):
             )
             if count > 1:
                 values = values.reshape(header["points"], count)[:, 0]
-            columns[name] = values.astype(np.float64, copy=False)
+            columns[name] = values
         offset += block_size
 
     return np.column_stack((columns["x"], columns["y"], columns["z"]))

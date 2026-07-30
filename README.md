@@ -67,9 +67,18 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 
 - 横轴为 X，纵轴为 Y，坐标单位为米
 - 每个 XY 像素的数值为落入该像素的所有点中最大的 Z
+- 每个 PCD 读取后立即进行三维体素下采样，每个体素保留 Z 最高点
+- 启动时缓存下采样后的 `float32` XYZ，后续重建不再读取 PCD
+- 启动时按缓存点云 Z 值的 `1%～99%` 百分位固定色标范围
+- BEV 固定为 `2560 × 1440`、16:9，窗口以 `1280 × 720` 启动并可手动调整大小
+- 图像及窗口标题由 `title` 参数指定，运行统计只输出到终端
 - 支持 `ascii`、`binary`、`binary_compressed` PCD
 - 鼠标滚轮以光标为中心缩放
 - 鼠标左键拖拽平移
+- 拖拽、连续滚轮缩放和窗口尺寸调整期间使用 `1280 × 720` 最大 Z
+  预览，停止交互后自动恢复完整 `2560 × 1440` BEV
+- 缩放范围限制在有效点云尺度内，避免无限放大或缩小
+- 点击 `Rebuild BEV`，根据当前视野重新生成 `2560 × 1440` BEV
 - 双击、按 `R` 或点击 `Reset view` 恢复完整视图
 - 也可以使用 Matplotlib 窗口自带的缩放和平移工具
 
@@ -78,7 +87,8 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 ```bash
 roslaunch data_monitor pcd_monitor.launch \
   pcd_dir:=/absolute/path/to/pcd_folder \
-  resolution:=0.10
+  voxel_size:=0.10 \
+  title:="My PCD Map"
 ```
 
 递归读取子目录：
@@ -93,10 +103,18 @@ roslaunch data_monitor pcd_monitor.launch \
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `pcd_dir` | 空 | PCD 文件目录，必须指定 |
-| `resolution` | `0.10` | BEV 分辨率，单位 m/pixel |
+| `pcd_dir` | `$HOME/disk/projects/ros1/data_monitor/src/test_data` | PCD 文件目录 |
+| `voxel_size` | `0.10` | 三维体素边长，单位为米，必须大于 0 |
+| `title` | `PCD BEV Monitor` | 图像和窗口标题 |
 | `recursive` | `false` | 是否递归搜索子目录 |
 | `colormap` | `turbo` | Matplotlib 色图名称 |
-| `max_grid_cells` | `16000000` | 最大 BEV 像素数，防止误用过多内存 |
 
-如果点云 XY 范围很大且分辨率过细，节点会提示建议的 `resolution`，以避免创建过大的 BEV 数组。
+每个 PCD 文件会单独读取并立即按 `voxel_size` 下采样，处理完后再读取下一个文件，避免所有原始点云同时驻留内存。全部文件处理完成后，节点只缓存合并后的 `float32` XYZ 下采样点云。初次启动时，节点使用缓存点云的 XY 范围建立 16:9 视野，并自动计算米/像素。放大或平移后，点击 `Rebuild BEV` 会直接从内存缓存筛选当前视野并重新栅格化，不再读取 PCD 或重复体素滤波；如果当前视野不是 16:9，节点会扩展其中一个方向，以保持 X/Y 分辨率一致。`Reset view` 会立即恢复初始完整 BEV。
+
+`voxel_size` 越大，保留的点越少，读取和重建所需内存越低，但点云细节也会相应减少。
+
+色图的 `vmin/vmax` 在启动时由缓存点云 Z 值的第 1 和第 99 百分位确定，之后全景、局部重建和复位始终使用相同范围。低于或高于该范围的少量极端值会显示为色图两端颜色。
+
+文件数、原始/下采样点数、当前视野点数、BEV 分辨率、体素尺寸、XYZ 范围和固定色标范围通过 ROS 日志输出，不会附加到图像标题。
+
+节点会针对 Tk、Qt 和 GTK Matplotlib 后端显式启用窗口调整大小，并解除 GUI 画布可能继承的固定尺寸限制；窗口大小变化不会改变缓存点云或 BEV 栅格分辨率。
