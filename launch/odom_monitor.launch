@@ -3,8 +3,8 @@
 
   <node
     pkg="data_monitor"
-    type="odometry_monitor_node.py"
-    name="odometry_monitor"
+    type="odom_monitor_node.py"
+    name="odom_monitor"
     required="true"
     output="screen">
     <param name="odom_topic" value="$(arg odom_topic)" />

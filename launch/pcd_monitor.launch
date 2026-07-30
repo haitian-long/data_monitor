@@ -1,0 +1,20 @@
+<launch>
+  <arg name="pcd_dir" default="$(env HOME)/disk/projects/ros1/fast_lio_ws/src/FAST_LIO_Hesai/PCD" />
+  <arg name="resolution" default="0.10" />
+  <arg name="recursive" default="false" />
+  <arg name="colormap" default="turbo" />
+  <arg name="max_grid_cells" default="30000000" />
+
+  <node
+    pkg="data_monitor"
+    type="pcd_monitor_node.py"
+    name="pcd_monitor"
+    required="true"
+    output="screen">
+    <param name="pcd_dir" value="$(arg pcd_dir)" />
+    <param name="resolution" value="$(arg resolution)" />
+    <param name="recursive" value="$(arg recursive)" />
+    <param name="colormap" value="$(arg colormap)" />
+    <param name="max_grid_cells" value="$(arg max_grid_cells)" />
+  </node>
+</launch>

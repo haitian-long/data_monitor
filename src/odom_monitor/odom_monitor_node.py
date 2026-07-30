@@ -11,7 +11,7 @@ from nav_msgs.msg import Odometry
 import rospy
 
 
-class OdometryMonitor:
+class OdomMonitor:
     def __init__(self):
         self.odom_topic = rospy.get_param("~odom_topic", "/odom")
 
@@ -42,7 +42,7 @@ class OdometryMonitor:
         )
 
         self.figure, self.axis = plt.subplots(figsize=(13.5, 7))
-        self.figure.canvas.manager.set_window_title("Odometry Monitor")
+        self.figure.canvas.manager.set_window_title("Odom Monitor")
 
         # 给右侧信息面板预留空间。
         self.figure.subplots_adjust(left=0.06, bottom=0.18, right=0.58)
@@ -293,7 +293,7 @@ class OdometryMonitor:
         self._draw_cards(
             [
                 (
-                    "Odometry Monitor",
+                    "Odom Monitor",
                     [
                         ("Status", "Waiting for odometry"),
                         ("Topic", self.odom_topic),
@@ -477,8 +477,8 @@ class OdometryMonitor:
 
 
 def main():
-    rospy.init_node("odometry_monitor")
-    monitor = OdometryMonitor()
+    rospy.init_node("odom_monitor")
+    monitor = OdomMonitor()
     monitor.show()
 
 

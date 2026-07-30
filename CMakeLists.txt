@@ -11,7 +11,8 @@ catkin_python_setup()
 catkin_package()
 
 catkin_install_python(PROGRAMS
-  src/data_monitor/odometry_monitor_node.py
+  src/odom_monitor/odom_monitor_node.py
+  src/pcd_monitor/pcd_monitor_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
