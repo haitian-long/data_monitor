@@ -111,9 +111,10 @@ roslaunch data_monitor pcd_monitor.launch \
 
 原始/下采样点数、当前视野点数、BEV 分辨率、体素尺寸、XYZ 范围和固定色标范围通过 ROS 日志输出，不会附加到图像标题。
 
-保存图片时，PNG 会写入 PCD 文件所在目录。文件名使用标题参数，例如
-`My PCD Map.png`。
-如果文件已经存在，则依次使用 `My PCD Map1.png`、`My PCD Map2.png`。
+保存图片时，PNG 会写入 PCD 文件所在目录。文件名使用读取的 PCD 文件名，
+例如读取 `merged_filtered.pcd` 时保存为 `merged_filtered.png`。
+如果文件已经存在，则依次使用 `merged_filtered_1.png`、
+`merged_filtered_2.png`。
 导出的图片不会包含操作按钮和底部操作说明。
 
 节点会针对 Tk、Qt 和 GTK Matplotlib 后端显式启用窗口调整大小，并解除 GUI 画布可能继承的固定尺寸限制；窗口大小变化不会改变缓存点云或 BEV 栅格分辨率。

@@ -692,14 +692,12 @@ class PcdMonitor:
             self.figure.canvas.draw_idle()
 
     def _next_export_path(self):
-        filename_stem = self.title.strip() or "PCD BEV Monitor"
-        filename_stem = filename_stem.replace("\x00", "_")
-        filename_stem = filename_stem.replace("/", "_").replace("\\", "_")
+        filename_stem = self.pcd_path.stem
 
         candidate = self.export_dir / "{}.png".format(filename_stem)
         suffix = 1
         while candidate.exists():
-            candidate = self.export_dir / "{}{}.png".format(
+            candidate = self.export_dir / "{}_{}.png".format(
                 filename_stem,
                 suffix,
             )
