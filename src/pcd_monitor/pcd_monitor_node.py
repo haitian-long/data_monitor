@@ -41,6 +41,7 @@ from pcd_monitor.pcd import (
     build_bev,
     extent_for_bounds,
     load_point_cloud,
+    read_tum_trajectory_positions,
     validate_pcd_file,
 )
 
@@ -75,6 +76,26 @@ class PcdMonitor:
         self.colormap = rospy.get_param("~colormap", "turbo")
         self.voxel_size = float(rospy.get_param("~voxel_size", 0.10))
         self.title = str(rospy.get_param("~title", "PCD BEV Monitor"))
+        trajectory_path_param = str(
+            rospy.get_param("~trajectory_path", "")
+        ).strip()
+        self.trajectory_path = None
+        self.trajectory_positions = None
+        if trajectory_path_param:
+            self.trajectory_path = Path(trajectory_path_param).expanduser()
+            try:
+                self.trajectory_positions = read_tum_trajectory_positions(
+                    self.trajectory_path
+                )
+            except PcdError as error:
+                rospy.logwarn("Skipping TUM trajectory: %s", error)
+                self.trajectory_path = None
+            else:
+                rospy.loginfo(
+                    "Loaded TUM trajectory: %s (%d poses)",
+                    self.trajectory_path,
+                    self.trajectory_positions.shape[0],
+                )
         self.selected_bev_width = self.BEV_WIDTH
         self.selected_bev_height = self.BEV_HEIGHT
 
@@ -181,6 +202,7 @@ class PcdMonitor:
             norm=self._normalization_for_bev(self.bev),
             aspect="equal",
         )
+        self.trajectory_line = self._draw_trajectory(self.axis)
         self._using_interaction_preview = False
         # Keep the BEV axes centered in the Figure. A normal colorbar with
         # ax=self.axis shrinks the main axes toward the left.
@@ -751,6 +773,7 @@ class PcdMonitor:
             norm=self._normalization_for_bev(self.bev),
             aspect="equal",
         )
+        self._draw_trajectory(export_axis)
         export_axis.set_anchor("C")
         export_colorbar_axis = inset_axes(
             export_axis,
@@ -780,6 +803,19 @@ class PcdMonitor:
         export_axis.set_xlim(self.axis.get_xlim())
         export_axis.set_ylim(self.axis.get_ylim())
         return export_figure
+
+    def _draw_trajectory(self, axis):
+        if self.trajectory_positions is None:
+            return None
+
+        (line,) = axis.plot(
+            self.trajectory_positions[:, 0],
+            self.trajectory_positions[:, 1],
+            color="#FBBC05",
+            linewidth=1.5,
+            zorder=5,
+        )
+        return line
 
     def _rebuild_clicked(self, _event):
         x_limits = self.axis.get_xlim()

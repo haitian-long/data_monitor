@@ -71,6 +71,7 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 - 每个体素保留 Z 最高点
 - 启动时缓存下采样后的 `float32` XYZ，后续重建不再读取 PCD
 - 启动时按缓存点云 Z 值的 `1%～99%` 百分位固定色标范围
+- 可选读取 TUM 格式轨迹，并按轨迹的 X-Y 坐标叠加到 BEV
 - 初始 BEV 为 `2560 × 1440`、16:9，窗口以 `1280 × 720` 启动并可手动调整大小
 - 图像及窗口标题由 `title` 参数指定，运行统计只输出到终端
 - 支持 `ascii`、`binary`、`binary_compressed` PCD
@@ -90,6 +91,7 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 ```bash
 roslaunch data_monitor pcd_monitor.launch \
   pcd_path:=/absolute/path/to/cloud.pcd \
+  trajectory_path:=/absolute/path/to/trajectory.txt \
   voxel_size:=0.10 \
   title:="My PCD Map"
 ```
@@ -99,6 +101,7 @@ roslaunch data_monitor pcd_monitor.launch \
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `pcd_path` | 无，必填 | 单个 PCD 文件路径，不支持目录 |
+| `trajectory_path` | 空 | 可选 TUM 轨迹文件路径；为空或格式错误时不加载 |
 | `voxel_size` | `0.10` | 三维体素边长，单位为米，必须大于 0 |
 | `title` | `PCD BEV Monitor` | 图像和窗口标题 |
 | `colormap` | `turbo` | Matplotlib 色图名称 |
@@ -115,6 +118,6 @@ roslaunch data_monitor pcd_monitor.launch \
 例如读取 `merged_filtered.pcd` 时保存为 `merged_filtered.png`。
 如果文件已经存在，则依次使用 `merged_filtered_1.png`、
 `merged_filtered_2.png`。
-导出的图片不会包含操作按钮和底部操作说明。
+导出的图片会包含已加载的轨迹，不会包含操作按钮和底部操作说明。
 
 节点会针对 Tk、Qt 和 GTK Matplotlib 后端显式启用窗口调整大小，并解除 GUI 画布可能继承的固定尺寸限制；窗口大小变化不会改变缓存点云或 BEV 栅格分辨率。

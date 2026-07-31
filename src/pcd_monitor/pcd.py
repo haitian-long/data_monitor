@@ -14,6 +14,62 @@ class PcdError(RuntimeError):
     pass
 
 
+def read_tum_trajectory_positions(input_path):
+    """Read XYZ positions from a TUM trajectory file."""
+    path = Path(input_path).expanduser()
+    if not path.exists():
+        raise PcdError("TUM trajectory file does not exist: {}".format(path))
+    if not path.is_file():
+        raise PcdError("TUM trajectory path is not a file: {}".format(path))
+
+    positions = []
+    try:
+        with path.open("r", encoding="utf-8-sig") as stream:
+            for line_number, raw_line in enumerate(stream, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                fields = line.split()
+                if len(fields) != 8:
+                    raise PcdError(
+                        "Invalid TUM trajectory line {} in {}: expected 8 "
+                        "values, got {}".format(line_number, path, len(fields))
+                    )
+                try:
+                    values = [float(field) for field in fields]
+                except ValueError as error:
+                    raise PcdError(
+                        "Invalid numeric value on TUM trajectory line {} in "
+                        "{}".format(line_number, path)
+                    ) from error
+                if not all(math.isfinite(value) for value in values):
+                    raise PcdError(
+                        "Non-finite value on TUM trajectory line {} in {}".format(
+                            line_number,
+                            path,
+                        )
+                    )
+
+                qx, qy, qz, qw = values[4:8]
+                if qx * qx + qy * qy + qz * qz + qw * qw == 0.0:
+                    raise PcdError(
+                        "Zero quaternion on TUM trajectory line {} in {}".format(
+                            line_number,
+                            path,
+                        )
+                    )
+                positions.append(values[1:4])
+    except (OSError, UnicodeError) as error:
+        raise PcdError(
+            "Could not read TUM trajectory {}: {}".format(path, error)
+        ) from error
+
+    if not positions:
+        raise PcdError("TUM trajectory contains no poses: {}".format(path))
+    return np.ascontiguousarray(positions, dtype=np.float64)
+
+
 def validate_pcd_file(input_path):
     """Validate and return one PCD file path."""
     path = Path(input_path).expanduser()

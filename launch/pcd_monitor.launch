@@ -3,6 +3,7 @@
   <arg name="voxel_size" default="0.10" />
   <arg name="title" default="PCD BEV Monitor" />
   <arg name="colormap" default="turbo" />
+  <arg name="trajectory_path" default="" />
 
   <node
     pkg="data_monitor"
@@ -14,5 +15,6 @@
     <param name="voxel_size" value="$(arg voxel_size)" />
     <param name="title" value="$(arg title)" />
     <param name="colormap" value="$(arg colormap)" />
+    <param name="trajectory_path" value="$(arg trajectory_path)" />
   </node>
 </launch>
