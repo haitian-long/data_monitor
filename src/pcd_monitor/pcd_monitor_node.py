@@ -28,7 +28,9 @@ def _prefer_xcb_on_wslg():
 WSLG_XCB_ENABLED = _prefer_xcb_on_wslg()
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import Normalize
+from matplotlib.figure import Figure
 from matplotlib.widgets import Button
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
@@ -46,6 +48,11 @@ from pcd_monitor.pcd import (
 class PcdMonitor:
     BEV_WIDTH = 2560
     BEV_HEIGHT = 1440
+    BEV_RESOLUTIONS = (
+        (2560, 1440),
+        (1280, 720),
+        (640, 360),
+    )
     BEV_ASPECT_RATIO = float(BEV_WIDTH) / float(BEV_HEIGHT)
     INITIAL_FIGURE_SIZE = (12.8, 7.2)
     FIGURE_DPI = 100
@@ -56,6 +63,7 @@ class PcdMonitor:
     MIN_VIEW_VOXELS = 8.0
     MAX_FULL_VIEW_SCALE = 4.0
     TITLE_PAD_POINTS = 15.0
+    EXPORT_DPI = 200
 
     def __init__(self):
         pcd_dir_param = str(rospy.get_param("~pcd_dir", "")).strip()
@@ -66,6 +74,8 @@ class PcdMonitor:
         self.colormap = rospy.get_param("~colormap", "turbo")
         self.voxel_size = float(rospy.get_param("~voxel_size", 0.10))
         self.title = str(rospy.get_param("~title", "PCD BEV Monitor"))
+        self.selected_bev_width = self.BEV_WIDTH
+        self.selected_bev_height = self.BEV_HEIGHT
 
         try:
             plt.get_cmap(self.colormap)
@@ -222,13 +232,44 @@ class PcdMonitor:
         )
         self.reset_button.on_clicked(self._reset_clicked)
 
-        self.figure.text(
-            0.49,
-            0.059,
-            "Wheel: zoom    Left drag: pan    Rebuild: rerasterize current view",
-            ha="left",
+        save_axis = self.figure.add_axes([0.48, 0.035, 0.18, 0.06])
+        self.save_button = Button(
+            save_axis,
+            "Save Image",
+            color="#059669",
+            hovercolor="#047857",
+        )
+        self._style_button(
+            save_axis,
+            self.save_button,
+            "#059669",
+            "#065f46",
+        )
+        self.save_button.on_clicked(self._save_clicked)
+
+        resolution_axis = self.figure.add_axes([0.675, 0.035, 0.18, 0.06])
+        self.resolution_button = Button(
+            resolution_axis,
+            self._resolution_button_label(),
+            color="#7c3aed",
+            hovercolor="#6d28d9",
+        )
+        self._style_button(
+            resolution_axis,
+            self.resolution_button,
+            "#7c3aed",
+            "#5b21b6",
+        )
+        self.resolution_button.on_clicked(self._toggle_resolution_popup)
+        self._create_resolution_popup()
+
+        self.help_text = self.figure.text(
+            0.5,
+            0.015,
+            "Wheel: zoom    Left drag: pan    Rebuild: current view",
+            ha="center",
             va="center",
-            fontsize=9,
+            fontsize=8.5,
             color="#4b5563",
         )
 
@@ -503,6 +544,106 @@ class PcdMonitor:
         button.label.set_fontsize(10)
         button.label.set_fontweight("bold")
 
+    def _resolution_button_label(self):
+        return "Resolution\n{}*{}".format(
+            self.selected_bev_width,
+            self.selected_bev_height,
+        )
+
+    def _create_resolution_popup(self):
+        self._resolution_popup_visible = False
+        self._resolution_option_axes = []
+        self._resolution_option_buttons = []
+
+        option_height = 0.042
+        option_gap = 0.004
+        popup_x = 0.675
+        popup_y = 0.105
+        for option_index, (width, height) in enumerate(
+            reversed(self.BEV_RESOLUTIONS)
+        ):
+            option_axis = self.figure.add_axes(
+                [
+                    popup_x,
+                    popup_y + option_index * (option_height + option_gap),
+                    0.18,
+                    option_height,
+                ]
+            )
+            option_axis.set_zorder(20)
+            is_selected = (
+                width == self.selected_bev_width
+                and height == self.selected_bev_height
+            )
+            facecolor = "#0f766e" if is_selected else "#4b5563"
+            hovercolor = "#0d9488" if is_selected else "#374151"
+            spine_color = "#115e59" if is_selected else "#1f2937"
+            option_button = Button(
+                option_axis,
+                "{}*{}".format(width, height),
+                color=facecolor,
+                hovercolor=hovercolor,
+            )
+            self._style_button(
+                option_axis,
+                option_button,
+                facecolor,
+                spine_color,
+            )
+            option_button.on_clicked(
+                lambda _event, selected_width=width, selected_height=height:
+                self._select_bev_resolution(selected_width, selected_height)
+            )
+            option_axis.set_visible(False)
+            self._resolution_option_axes.append(option_axis)
+            self._resolution_option_buttons.append(
+                (option_button, width, height)
+            )
+
+    def _toggle_resolution_popup(self, _event):
+        self._set_resolution_popup_visible(
+            not self._resolution_popup_visible
+        )
+
+    def _set_resolution_popup_visible(self, visible):
+        self._resolution_popup_visible = bool(visible)
+        for option_axis in self._resolution_option_axes:
+            option_axis.set_visible(self._resolution_popup_visible)
+        self.figure.canvas.draw_idle()
+
+    def _select_bev_resolution(self, width, height):
+        self.selected_bev_width = width
+        self.selected_bev_height = height
+        self.resolution_button.label.set_text(
+            self._resolution_button_label()
+        )
+        self._update_resolution_option_styles()
+        self._set_resolution_popup_visible(False)
+        rospy.loginfo(
+            "Selected BEV rebuild resolution: %d x %d; "
+            "click Rebuild BEV to apply",
+            width,
+            height,
+        )
+
+    def _update_resolution_option_styles(self):
+        for option_button, width, height in self._resolution_option_buttons:
+            is_selected = (
+                width == self.selected_bev_width
+                and height == self.selected_bev_height
+            )
+            facecolor = "#0f766e" if is_selected else "#4b5563"
+            hovercolor = "#0d9488" if is_selected else "#374151"
+            spine_color = "#115e59" if is_selected else "#1f2937"
+            option_button.color = facecolor
+            option_button.hovercolor = hovercolor
+            self._style_button(
+                option_button.ax,
+                option_button,
+                facecolor,
+                spine_color,
+            )
+
     def _show_interaction_preview(self):
         if (
             self._using_interaction_preview
@@ -535,6 +676,109 @@ class PcdMonitor:
     def _reset_clicked(self, _event):
         self._restore_full_bev()
 
+    def _save_clicked(self, _event):
+        self.save_button.label.set_text("Saving...")
+        self.figure.canvas.draw()
+        try:
+            output_path = self._next_export_path()
+            self._save_bev_image(output_path)
+        except (OSError, ValueError) as error:
+            rospy.logerr("Could not save PCD BEV image: %s", error)
+        else:
+            rospy.loginfo("Saved PCD BEV image: %s", output_path)
+        finally:
+            self.save_button.label.set_text("Save Image")
+            self.figure.canvas.draw_idle()
+
+    def _next_export_path(self):
+        filename_stem = self.title.strip() or "PCD BEV Monitor"
+        filename_stem = filename_stem.replace("\x00", "_")
+        filename_stem = filename_stem.replace("/", "_").replace("\\", "_")
+
+        candidate = self.pcd_dir / "{}.png".format(filename_stem)
+        suffix = 1
+        while candidate.exists():
+            candidate = self.pcd_dir / "{}{}.png".format(filename_stem, suffix)
+            suffix += 1
+        return candidate
+
+    def _save_bev_image(self, output_path):
+        export_figure = self._create_export_figure()
+        try:
+            export_figure.savefig(
+                str(output_path),
+                dpi=self.EXPORT_DPI,
+                format="png",
+                facecolor="#ffffff",
+            )
+        finally:
+            export_figure.clear()
+
+    def _create_export_figure(self):
+        export_figure = Figure(
+            figsize=self.INITIAL_FIGURE_SIZE,
+            dpi=self.EXPORT_DPI,
+        )
+        FigureCanvasAgg(export_figure)
+        export_axis = export_figure.subplots()
+        export_figure.subplots_adjust(
+            left=0.07,
+            bottom=0.09,
+            right=0.93,
+            top=0.91,
+        )
+        plot_position = export_axis.get_position()
+        export_axis.set_position(
+            (
+                (1.0 - plot_position.width) / 2.0,
+                plot_position.y0,
+                plot_position.width,
+                plot_position.height,
+            )
+        )
+
+        colormap = copy.copy(plt.get_cmap(self.colormap))
+        colormap.set_bad(color="#f3f4f6", alpha=1.0)
+        export_image = export_axis.imshow(
+            self._full_image_grid,
+            origin="lower",
+            extent=self.bev["extent"],
+            interpolation="nearest",
+            resample=False,
+            cmap=colormap,
+            norm=self._normalization_for_bev(self.bev),
+            aspect="equal",
+        )
+        export_axis.set_anchor("C")
+        export_colorbar_axis = inset_axes(
+            export_axis,
+            width="2.5%",
+            height="100%",
+            loc="lower left",
+            bbox_to_anchor=(1.02, 0.0, 1.0, 1.0),
+            bbox_transform=export_axis.transAxes,
+            borderpad=0.0,
+        )
+        export_colorbar = export_figure.colorbar(
+            export_image,
+            cax=export_colorbar_axis,
+        )
+        export_colorbar.set_label("Maximum Z in pixel (m), fixed P1-P99")
+
+        export_axis.set_title(self.title, pad=self.TITLE_PAD_POINTS)
+        export_axis.set_xlabel("X (m)")
+        export_axis.set_ylabel("Y (m)")
+        export_axis.grid(
+            True,
+            color="#ffffff",
+            linestyle="--",
+            linewidth=0.45,
+            alpha=0.35,
+        )
+        export_axis.set_xlim(self.axis.get_xlim())
+        export_axis.set_ylim(self.axis.get_ylim())
+        return export_figure
+
     def _rebuild_clicked(self, _event):
         x_limits = self.axis.get_xlim()
         y_limits = self.axis.get_ylim()
@@ -551,8 +795,8 @@ class PcdMonitor:
             bev = build_bev(
                 self.sampled_xyz,
                 extent,
-                grid_width=self.BEV_WIDTH,
-                grid_height=self.BEV_HEIGHT,
+                grid_width=self.selected_bev_width,
+                grid_height=self.selected_bev_height,
                 dataset_stats=self.dataset_stats,
             )
         except PcdError as error:
