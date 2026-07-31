@@ -40,8 +40,8 @@ from pcd_monitor.pcd import (
     PcdError,
     build_bev,
     extent_for_bounds,
-    find_pcd_files,
-    load_point_clouds,
+    load_point_cloud,
+    validate_pcd_file,
 )
 
 
@@ -69,11 +69,9 @@ class PcdMonitor:
         pcd_path_param = str(rospy.get_param("~pcd_path", "")).strip()
         if not pcd_path_param:
             raise PcdError(
-                "~pcd_path is empty; set it to a PCD file or a folder "
-                "containing PCD files"
+                "~pcd_path is empty; set it to a single PCD file"
             )
-        self.pcd_path = Path(pcd_path_param).expanduser()
-        self.recursive = bool(rospy.get_param("~recursive", False))
+        self.pcd_path = validate_pcd_file(pcd_path_param)
         self.colormap = rospy.get_param("~colormap", "turbo")
         self.voxel_size = float(rospy.get_param("~voxel_size", 0.10))
         self.title = str(rospy.get_param("~title", "PCD BEV Monitor"))
@@ -85,23 +83,15 @@ class PcdMonitor:
         except ValueError as error:
             raise PcdError("Unknown Matplotlib colormap: {}".format(self.colormap)) from error
 
-        if self.pcd_path.is_file():
-            rospy.loginfo("Using PCD file: %s", self.pcd_path)
-        else:
-            rospy.loginfo("Scanning PCD directory: %s", self.pcd_path)
-        self.pcd_files = find_pcd_files(self.pcd_path, self.recursive)
-        self.export_dir = (
-            self.pcd_path.parent
-            if self.pcd_path.is_file()
-            else self.pcd_path
-        )
+        rospy.loginfo("Using PCD file: %s", self.pcd_path)
+        self.export_dir = self.pcd_path.parent
         rospy.loginfo(
-            "Found %d PCD file(s), applying %.6g m voxel filter...",
-            len(self.pcd_files),
+            "Reading the complete PCD file, then applying one %.6g m "
+            "voxel filter...",
             self.voxel_size,
         )
-        self.sampled_xyz, self.dataset_stats = load_point_clouds(
-            self.pcd_files,
+        self.sampled_xyz, self.dataset_stats = load_point_cloud(
+            self.pcd_path,
             self.voxel_size,
         )
         rospy.loginfo(

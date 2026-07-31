@@ -63,12 +63,12 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 
 ## PCD BEV 查看
 
-`pcd_monitor` 可以读取一个指定的 `.pcd` 文件，也可以扫描指定目录内的
-所有 `.pcd` 文件并合并为一幅鸟瞰图：
+`pcd_monitor` 读取一个指定的 `.pcd` 文件并生成鸟瞰图：
 
 - 横轴为 X，纵轴为 Y，坐标单位为米
 - 每个 XY 像素的数值为落入该像素的所有点中最大的 Z
-- 每个 PCD 读取后立即进行三维体素下采样，每个体素保留 Z 最高点
+- 启动时一次性读取完整 PCD，然后执行一次全局三维体素下采样
+- 每个体素保留 Z 最高点
 - 启动时缓存下采样后的 `float32` XYZ，后续重建不再读取 PCD
 - 启动时按缓存点云 Z 值的 `1%～99%` 百分位固定色标范围
 - 初始 BEV 为 `2560 × 1440`、16:9，窗口以 `1280 × 720` 启动并可手动调整大小
@@ -88,50 +88,31 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 运行：
 
 ```bash
-# 读取目录下的所有 PCD
-roslaunch data_monitor pcd_monitor.launch \
-  pcd_path:=/absolute/path/to/pcd_folder \
-  voxel_size:=0.10 \
-  title:="My PCD Map"
-```
-
-只读取一个 PCD 文件：
-
-```bash
 roslaunch data_monitor pcd_monitor.launch \
   pcd_path:=/absolute/path/to/cloud.pcd \
   voxel_size:=0.10 \
   title:="My PCD Map"
 ```
 
-递归读取子目录：
-
-```bash
-roslaunch data_monitor pcd_monitor.launch \
-  pcd_path:=/absolute/path/to/pcd_folder \
-  recursive:=true
-```
-
 主要参数：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `pcd_path` | `$HOME/disk/projects/ros1/data_monitor/src/test_data` | 单个 PCD 文件或 PCD 文件目录 |
+| `pcd_path` | 无，必填 | 单个 PCD 文件路径，不支持目录 |
 | `voxel_size` | `0.10` | 三维体素边长，单位为米，必须大于 0 |
 | `title` | `PCD BEV Monitor` | 图像和窗口标题 |
-| `recursive` | `false` | 输入为目录时，是否递归搜索子目录 |
 | `colormap` | `turbo` | Matplotlib 色图名称 |
 
-每个 PCD 文件会单独读取并立即按 `voxel_size` 下采样，处理完后再读取下一个文件，避免所有原始点云同时驻留内存。全部文件处理完成后，节点只缓存合并后的 `float32` XYZ 下采样点云。初次启动时，节点使用缓存点云的 XY 范围建立 16:9 视野，并自动计算米/像素。放大或平移后，可以先选择 BEV 分辨率，再点击 `Rebuild BEV`，直接从内存缓存筛选当前视野并重新栅格化，不再读取 PCD 或重复体素滤波；如果当前视野不是 16:9，节点会扩展其中一个方向，以保持 X/Y 分辨率一致。`Reset view` 会立即恢复初始完整 BEV。
+节点启动时先将完整 PCD 的 XYZ 读取到内存，再按 `voxel_size` 执行一次全局下采样，之后只缓存 `float32` XYZ 下采样点云。初次启动时，节点使用缓存点云的 XY 范围建立 16:9 视野，并自动计算米/像素。放大或平移后，可以先选择 BEV 分辨率，再点击 `Rebuild BEV`，直接从内存缓存筛选当前视野并重新栅格化，不再读取 PCD 或重复体素滤波；如果当前视野不是 16:9，节点会扩展其中一个方向，以保持 X/Y 分辨率一致。`Reset view` 会立即恢复初始完整 BEV。
 
 `voxel_size` 越大，保留的点越少，读取和重建所需内存越低，但点云细节也会相应减少。
 
 色图的 `vmin/vmax` 在启动时由缓存点云 Z 值的第 1 和第 99 百分位确定，之后全景、局部重建和复位始终使用相同范围。低于或高于该范围的少量极端值会显示为色图两端颜色。
 
-文件数、原始/下采样点数、当前视野点数、BEV 分辨率、体素尺寸、XYZ 范围和固定色标范围通过 ROS 日志输出，不会附加到图像标题。
+原始/下采样点数、当前视野点数、BEV 分辨率、体素尺寸、XYZ 范围和固定色标范围通过 ROS 日志输出，不会附加到图像标题。
 
-保存图片时，如果输入是目录，PNG 会写入该目录；如果输入是单个 PCD，
-PNG 会写入该文件所在目录。文件名使用标题参数，例如 `My PCD Map.png`。
+保存图片时，PNG 会写入 PCD 文件所在目录。文件名使用标题参数，例如
+`My PCD Map.png`。
 如果文件已经存在，则依次使用 `My PCD Map1.png`、`My PCD Map2.png`。
 导出的图片不会包含操作按钮和底部操作说明。
 

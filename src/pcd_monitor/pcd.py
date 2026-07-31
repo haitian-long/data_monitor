@@ -5,8 +5,6 @@ from pathlib import Path
 import numpy as np
 
 
-PCD_CHUNK_POINTS = 1000000
-VOXEL_MERGE_POINT_LIMIT = 4000000
 DISPLAY_Z_PERCENTILES = (1.0, 99.0)
 
 
@@ -14,29 +12,19 @@ class PcdError(RuntimeError):
     pass
 
 
-def find_pcd_files(input_path, recursive=False):
-    """Return one PCD file or deterministically sorted PCDs under a directory."""
-    root = Path(input_path).expanduser()
-    if root.is_file():
-        if root.suffix.lower() != ".pcd":
-            raise PcdError("PCD input file must have a .pcd extension: {}".format(root))
-        return [root]
-
-    if not root.exists():
-        raise PcdError("PCD input path does not exist: {}".format(root))
-    if not root.is_dir():
-        raise PcdError("PCD input path is not a file or directory: {}".format(root))
-
-    pattern = "**/*" if recursive else "*"
-    files = [
-        path
-        for path in root.glob(pattern)
-        if path.is_file() and path.suffix.lower() == ".pcd"
-    ]
-    files.sort(key=lambda path: str(path).lower())
-    if not files:
-        raise PcdError("No .pcd files found in: {}".format(root))
-    return files
+def validate_pcd_file(input_path):
+    """Validate and return one PCD file path."""
+    path = Path(input_path).expanduser()
+    if not path.exists():
+        raise PcdError("PCD input file does not exist: {}".format(path))
+    if not path.is_file():
+        raise PcdError(
+            "PCD input path must be a single .pcd file; directories are not "
+            "supported: {}".format(path)
+        )
+    if path.suffix.lower() != ".pcd":
+        raise PcdError("PCD input file must have a .pcd extension: {}".format(path))
+    return path
 
 
 def read_pcd_xyz(path):
@@ -121,98 +109,17 @@ def voxel_downsample(xyz, voxel_size):
     return xyz[representative_indices]
 
 
-def read_pcd_xyz_voxelized(path, voxel_size, chunk_points=PCD_CHUNK_POINTS):
-    """
-    Read a PCD in bounded chunks and return its voxel-filtered XYZ points.
-
-    ASCII and uncompressed binary payloads are streamed. binary_compressed must
-    still be decompressed as one block because that is how the PCD format stores
-    it, but it is voxel-filtered immediately afterward.
-    """
-    if (
-        isinstance(chunk_points, bool)
-        or not isinstance(chunk_points, int)
-        or chunk_points <= 0
-    ):
-        raise PcdError("chunk_points must be a positive integer")
-
-    path = Path(path)
-    try:
-        with path.open("rb") as stream:
-            header = _read_header(stream, path)
-            if header["data"] == "ascii":
-                chunks = _iter_ascii_xyz_chunks(
-                    stream,
-                    header,
-                    path,
-                    chunk_points,
-                )
-            elif header["data"] == "binary":
-                chunks = _iter_binary_xyz_chunks(
-                    stream,
-                    header,
-                    path,
-                    chunk_points,
-                )
-            elif header["data"] == "binary_compressed":
-                chunks = iter((_read_binary_compressed_xyz(stream, header, path),))
-            else:
-                raise PcdError(
-                    "Unsupported PCD DATA type '{}' in {}".format(header["data"], path)
-                )
-
-            sampled_chunks = []
-            buffered_points = 0
-            total_points = 0
-            finite_points = 0
-            for xyz in chunks:
-                total_points += int(xyz.shape[0])
-                finite_points += int(np.count_nonzero(np.isfinite(xyz).all(axis=1)))
-                sampled = voxel_downsample(xyz, voxel_size)
-                if sampled.size == 0:
-                    continue
-                sampled_chunks.append(sampled)
-                buffered_points += int(sampled.shape[0])
-                if buffered_points >= VOXEL_MERGE_POINT_LIMIT:
-                    sampled_chunks = [
-                        _merge_voxel_chunks(sampled_chunks, voxel_size)
-                    ]
-                    buffered_points = int(sampled_chunks[0].shape[0])
-    except OSError as error:
-        raise PcdError("Could not read {}: {}".format(path, error)) from error
-
-    sampled = _merge_voxel_chunks(sampled_chunks, voxel_size)
-    return sampled, total_points, finite_points
-
-
-def load_point_clouds(pcd_files, voxel_size):
-    """Read all PCD files once and return a cached voxel-filtered XYZ array."""
-    files = [Path(path) for path in pcd_files]
-    if not files:
-        raise PcdError("No PCD files were provided")
-
-    total_points = 0
-    finite_points = 0
-    sampled_clouds = []
-
-    # Each raw cloud is downsampled immediately. Only its compact sampled result
-    # is retained while the next file is processed.
-    for path in files:
-        xyz, file_total_points, file_finite_points = read_pcd_xyz_voxelized(
-            path,
-            voxel_size,
-        )
-        total_points += file_total_points
-        finite_points += file_finite_points
-        if xyz.size:
-            sampled_clouds.append(xyz)
-
+def load_point_cloud(pcd_file, voxel_size):
+    """Read one complete PCD file, then voxel-filter its XYZ points once."""
+    path = validate_pcd_file(pcd_file)
+    xyz = read_pcd_xyz(path)
+    total_points = int(xyz.shape[0])
+    finite_points = int(np.count_nonzero(np.isfinite(xyz).all(axis=1)))
     if finite_points == 0:
-        raise PcdError("The selected PCD files contain no finite XYZ points")
+        raise PcdError("The selected PCD file contains no finite XYZ points")
 
-    # Merge once more so overlapping PCD files also share one representative
-    # point per voxel. float32 keeps the persistent XYZ cache compact.
-    sampled_xyz = _merge_voxel_chunks(sampled_clouds, voxel_size)
+    sampled_xyz = voxel_downsample(xyz, voxel_size)
+    del xyz
     sampled_xyz = np.ascontiguousarray(sampled_xyz, dtype=np.float32)
     mins = np.min(sampled_xyz, axis=0)
     maxs = np.max(sampled_xyz, axis=0)
@@ -221,7 +128,7 @@ def load_point_clouds(pcd_files, voxel_size):
         DISPLAY_Z_PERCENTILES,
     )
     stats = {
-        "file_count": len(files),
+        "file_count": 1,
         "total_points": total_points,
         "finite_points": finite_points,
         "sampled_points": int(sampled_xyz.shape[0]),
@@ -385,14 +292,6 @@ def _voxel_indices(values, voxel_size):
     return scaled.astype(np.int64)
 
 
-def _merge_voxel_chunks(chunks, voxel_size):
-    if not chunks:
-        return np.empty((0, 3), dtype=np.float32)
-    if len(chunks) == 1:
-        return chunks[0]
-    return voxel_downsample(np.concatenate(chunks, axis=0), voxel_size)
-
-
 def _read_header(stream, path):
     raw_header = {}
     while True:
@@ -472,32 +371,6 @@ def _read_ascii_xyz(stream, header, path):
     return points
 
 
-def _iter_ascii_xyz_chunks(stream, header, path, chunk_points):
-    xyz_columns = _ascii_xyz_columns(header)
-    remaining = header["points"]
-    while remaining > 0:
-        requested = min(remaining, chunk_points)
-        try:
-            points = np.loadtxt(
-                stream,
-                dtype=np.float32,
-                comments="#",
-                usecols=xyz_columns,
-                ndmin=2,
-                max_rows=requested,
-            )
-        except (ValueError, IndexError) as error:
-            raise PcdError(
-                "Could not parse ASCII point data in {}: {}".format(path, error)
-            ) from error
-        if points.shape[0] == 0:
-            raise PcdError(
-                "ASCII payload in {} ended before its declared POINTS count".format(path)
-            )
-        remaining -= int(points.shape[0])
-        yield points
-
-
 def _ascii_xyz_columns(header):
     field_columns = {}
     column = 0
@@ -520,23 +393,6 @@ def _read_binary_xyz(stream, header, path):
 
     records = np.frombuffer(data, dtype=point_dtype, count=header["points"])
     return _binary_records_xyz(records, header, safe_names)
-
-
-def _iter_binary_xyz_chunks(stream, header, path, chunk_points):
-    point_dtype, safe_names = _binary_layout(header, path)
-    remaining = header["points"]
-    while remaining > 0:
-        point_count = min(remaining, chunk_points)
-        expected_size = point_count * point_dtype.itemsize
-        data = stream.read(expected_size)
-        if len(data) != expected_size:
-            raise PcdError(
-                "Binary payload in {} is {} bytes short of its declared "
-                "POINTS count".format(path, expected_size - len(data))
-            )
-        records = np.frombuffer(data, dtype=point_dtype, count=point_count)
-        yield _binary_records_xyz(records, header, safe_names)
-        remaining -= point_count
 
 
 def _binary_layout(header, path):
