@@ -836,7 +836,8 @@ class PcdMonitor:
         color_min_z, color_max_z = bev["display_z_range"]
         rospy.loginfo(
             "%s: %d x %d, %.6g m/pixel, voxel %.6g m, "
-            "%d/%d sampled points in view, %d occupied pixels",
+            "%d/%d sampled points in view, %d occupied pixels, "
+            "%d raster threads",
             label,
             bev["grid_width"],
             bev["grid_height"],
@@ -845,6 +846,7 @@ class PcdMonitor:
             bev["visible_points"],
             bev["sampled_points"],
             bev["occupied_pixels"],
+            bev["raster_workers"],
         )
         rospy.loginfo(
             "%s ranges: X [%.6g, %.6g] m, Y [%.6g, %.6g] m, "

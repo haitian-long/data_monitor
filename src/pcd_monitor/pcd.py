@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import math
 import struct
 from pathlib import Path
@@ -6,6 +7,7 @@ import numpy as np
 
 
 DISPLAY_Z_PERCENTILES = (1.0, 99.0)
+BEV_RASTER_WORKERS = 4
 
 
 class PcdError(RuntimeError):
@@ -238,7 +240,6 @@ def build_bev(
         )
 
     resolution = span_x / float(grid_width)
-    grid = np.full((grid_height, grid_width), -np.inf, dtype=np.float32)
 
     # Points on the maximum boundary are included in the last row/column.
     inside = (
@@ -249,15 +250,37 @@ def build_bev(
     )
     xyz = sampled_xyz[inside]
     visible_points = int(xyz.shape[0])
-    if xyz.size:
-        pixel_x = np.floor((xyz[:, 0] - min_x) / resolution).astype(np.int64)
-        pixel_y = np.floor((xyz[:, 1] - min_y) / resolution).astype(np.int64)
-        pixel_x = np.clip(pixel_x, 0, grid_width - 1)
-        pixel_y = np.clip(pixel_y, 0, grid_height - 1)
-        np.maximum.at(
-            grid,
-            (pixel_y, pixel_x),
-            xyz[:, 2].astype(np.float32, copy=False),
+    raster_workers = min(BEV_RASTER_WORKERS, visible_points)
+    if raster_workers:
+        chunks = np.array_split(xyz, raster_workers)
+        with ThreadPoolExecutor(
+            max_workers=raster_workers,
+            thread_name_prefix="bev-raster",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _rasterize_bev_chunk,
+                    chunk,
+                    min_x,
+                    min_y,
+                    resolution,
+                    grid_width,
+                    grid_height,
+                )
+                for chunk in chunks
+            ]
+            partial_grids = [future.result() for future in futures]
+
+        # Each thread writes only to its own grid. Merge the four maximum-Z
+        # grids in place so rasterization has no shared-write data race.
+        grid = partial_grids[0]
+        for partial_grid in partial_grids[1:]:
+            np.maximum(grid, partial_grid, out=grid)
+    else:
+        grid = np.full(
+            (grid_height, grid_width),
+            -np.inf,
+            dtype=np.float32,
         )
 
     occupied_pixels = int(np.count_nonzero(np.isfinite(grid)))
@@ -277,8 +300,34 @@ def build_bev(
         "display_z_range": dataset_stats["display_z_range"],
         "visible_points": visible_points,
         "occupied_pixels": occupied_pixels,
+        "raster_workers": raster_workers,
         "xyz_bounds": dataset_stats["xyz_bounds"],
     }
+
+
+def _rasterize_bev_chunk(
+    xyz,
+    min_x,
+    min_y,
+    resolution,
+    grid_width,
+    grid_height,
+):
+    """Rasterize one point chunk into a thread-local maximum-Z grid."""
+    grid = np.full((grid_height, grid_width), -np.inf, dtype=np.float32)
+    if not xyz.size:
+        return grid
+
+    pixel_x = np.floor((xyz[:, 0] - min_x) / resolution).astype(np.int64)
+    pixel_y = np.floor((xyz[:, 1] - min_y) / resolution).astype(np.int64)
+    pixel_x = np.clip(pixel_x, 0, grid_width - 1)
+    pixel_y = np.clip(pixel_y, 0, grid_height - 1)
+    np.maximum.at(
+        grid,
+        (pixel_y, pixel_x),
+        xyz[:, 2].astype(np.float32, copy=False),
+    )
+    return grid
 
 
 def _voxel_indices(values, voxel_size):
