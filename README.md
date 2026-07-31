@@ -63,7 +63,8 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 
 ## PCD BEV 查看
 
-`pcd_monitor` 会读取指定目录内的所有 `.pcd` 文件并合并为一幅鸟瞰图：
+`pcd_monitor` 可以读取一个指定的 `.pcd` 文件，也可以扫描指定目录内的
+所有 `.pcd` 文件并合并为一幅鸟瞰图：
 
 - 横轴为 X，纵轴为 Y，坐标单位为米
 - 每个 XY 像素的数值为落入该像素的所有点中最大的 Z
@@ -87,8 +88,18 @@ rosrun data_monitor odom_monitor_node.py _odom_topic:=/odom
 运行：
 
 ```bash
+# 读取目录下的所有 PCD
 roslaunch data_monitor pcd_monitor.launch \
-  pcd_dir:=/absolute/path/to/pcd_folder \
+  pcd_path:=/absolute/path/to/pcd_folder \
+  voxel_size:=0.10 \
+  title:="My PCD Map"
+```
+
+只读取一个 PCD 文件：
+
+```bash
+roslaunch data_monitor pcd_monitor.launch \
+  pcd_path:=/absolute/path/to/cloud.pcd \
   voxel_size:=0.10 \
   title:="My PCD Map"
 ```
@@ -97,7 +108,7 @@ roslaunch data_monitor pcd_monitor.launch \
 
 ```bash
 roslaunch data_monitor pcd_monitor.launch \
-  pcd_dir:=/absolute/path/to/pcd_folder \
+  pcd_path:=/absolute/path/to/pcd_folder \
   recursive:=true
 ```
 
@@ -105,10 +116,10 @@ roslaunch data_monitor pcd_monitor.launch \
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `pcd_dir` | `$HOME/disk/projects/ros1/data_monitor/src/test_data` | PCD 文件目录 |
+| `pcd_path` | `$HOME/disk/projects/ros1/data_monitor/src/test_data` | 单个 PCD 文件或 PCD 文件目录 |
 | `voxel_size` | `0.10` | 三维体素边长，单位为米，必须大于 0 |
 | `title` | `PCD BEV Monitor` | 图像和窗口标题 |
-| `recursive` | `false` | 是否递归搜索子目录 |
+| `recursive` | `false` | 输入为目录时，是否递归搜索子目录 |
 | `colormap` | `turbo` | Matplotlib 色图名称 |
 
 每个 PCD 文件会单独读取并立即按 `voxel_size` 下采样，处理完后再读取下一个文件，避免所有原始点云同时驻留内存。全部文件处理完成后，节点只缓存合并后的 `float32` XYZ 下采样点云。初次启动时，节点使用缓存点云的 XY 范围建立 16:9 视野，并自动计算米/像素。放大或平移后，可以先选择 BEV 分辨率，再点击 `Rebuild BEV`，直接从内存缓存筛选当前视野并重新栅格化，不再读取 PCD 或重复体素滤波；如果当前视野不是 16:9，节点会扩展其中一个方向，以保持 X/Y 分辨率一致。`Reset view` 会立即恢复初始完整 BEV。
@@ -119,8 +130,9 @@ roslaunch data_monitor pcd_monitor.launch \
 
 文件数、原始/下采样点数、当前视野点数、BEV 分辨率、体素尺寸、XYZ 范围和固定色标范围通过 ROS 日志输出，不会附加到图像标题。
 
-保存图片时，PNG 会写入 `pcd_dir` 指定的点云目录，文件名使用标题参数，例如
-`My PCD Map.png`。如果文件已经存在，则依次使用 `My PCD Map1.png`、
-`My PCD Map2.png`。导出的图片不会包含操作按钮和底部操作说明。
+保存图片时，如果输入是目录，PNG 会写入该目录；如果输入是单个 PCD，
+PNG 会写入该文件所在目录。文件名使用标题参数，例如 `My PCD Map.png`。
+如果文件已经存在，则依次使用 `My PCD Map1.png`、`My PCD Map2.png`。
+导出的图片不会包含操作按钮和底部操作说明。
 
 节点会针对 Tk、Qt 和 GTK Matplotlib 后端显式启用窗口调整大小，并解除 GUI 画布可能继承的固定尺寸限制；窗口大小变化不会改变缓存点云或 BEV 栅格分辨率。

@@ -1,5 +1,5 @@
 <launch>
-  <arg name="pcd_dir" default="$(env HOME)/disk/projects/ros1/data_monitor/src/test_data" />
+  <arg name="pcd_path" default="$(env HOME)/disk/projects/ros1/data_monitor/src/test_data" />
   <arg name="voxel_size" default="0.10" />
   <arg name="title" default="PCD BEV Monitor" />
   <arg name="recursive" default="false" />
@@ -11,7 +11,7 @@
     name="pcd_monitor"
     required="true"
     output="screen">
-    <param name="pcd_dir" value="$(arg pcd_dir)" />
+    <param name="pcd_path" value="$(arg pcd_path)" />
     <param name="voxel_size" value="$(arg voxel_size)" />
     <param name="title" value="$(arg title)" />
     <param name="recursive" value="$(arg recursive)" />

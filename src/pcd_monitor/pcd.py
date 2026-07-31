@@ -14,11 +14,18 @@ class PcdError(RuntimeError):
     pass
 
 
-def find_pcd_files(directory, recursive=False):
-    """Return deterministically sorted PCD files under directory."""
-    root = Path(directory).expanduser()
+def find_pcd_files(input_path, recursive=False):
+    """Return one PCD file or deterministically sorted PCDs under a directory."""
+    root = Path(input_path).expanduser()
+    if root.is_file():
+        if root.suffix.lower() != ".pcd":
+            raise PcdError("PCD input file must have a .pcd extension: {}".format(root))
+        return [root]
+
+    if not root.exists():
+        raise PcdError("PCD input path does not exist: {}".format(root))
     if not root.is_dir():
-        raise PcdError("PCD directory does not exist or is not a directory: {}".format(root))
+        raise PcdError("PCD input path is not a file or directory: {}".format(root))
 
     pattern = "**/*" if recursive else "*"
     files = [

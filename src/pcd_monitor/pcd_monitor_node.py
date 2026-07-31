@@ -66,10 +66,13 @@ class PcdMonitor:
     EXPORT_DPI = 200
 
     def __init__(self):
-        pcd_dir_param = str(rospy.get_param("~pcd_dir", "")).strip()
-        if not pcd_dir_param:
-            raise PcdError("~pcd_dir is empty; set it to a folder containing PCD files")
-        self.pcd_dir = Path(pcd_dir_param).expanduser()
+        pcd_path_param = str(rospy.get_param("~pcd_path", "")).strip()
+        if not pcd_path_param:
+            raise PcdError(
+                "~pcd_path is empty; set it to a PCD file or a folder "
+                "containing PCD files"
+            )
+        self.pcd_path = Path(pcd_path_param).expanduser()
         self.recursive = bool(rospy.get_param("~recursive", False))
         self.colormap = rospy.get_param("~colormap", "turbo")
         self.voxel_size = float(rospy.get_param("~voxel_size", 0.10))
@@ -82,8 +85,16 @@ class PcdMonitor:
         except ValueError as error:
             raise PcdError("Unknown Matplotlib colormap: {}".format(self.colormap)) from error
 
-        rospy.loginfo("Scanning PCD directory: %s", self.pcd_dir)
-        self.pcd_files = find_pcd_files(self.pcd_dir, self.recursive)
+        if self.pcd_path.is_file():
+            rospy.loginfo("Using PCD file: %s", self.pcd_path)
+        else:
+            rospy.loginfo("Scanning PCD directory: %s", self.pcd_path)
+        self.pcd_files = find_pcd_files(self.pcd_path, self.recursive)
+        self.export_dir = (
+            self.pcd_path.parent
+            if self.pcd_path.is_file()
+            else self.pcd_path
+        )
         rospy.loginfo(
             "Found %d PCD file(s), applying %.6g m voxel filter...",
             len(self.pcd_files),
@@ -695,10 +706,13 @@ class PcdMonitor:
         filename_stem = filename_stem.replace("\x00", "_")
         filename_stem = filename_stem.replace("/", "_").replace("\\", "_")
 
-        candidate = self.pcd_dir / "{}.png".format(filename_stem)
+        candidate = self.export_dir / "{}.png".format(filename_stem)
         suffix = 1
         while candidate.exists():
-            candidate = self.pcd_dir / "{}{}.png".format(filename_stem, suffix)
+            candidate = self.export_dir / "{}{}.png".format(
+                filename_stem,
+                suffix,
+            )
             suffix += 1
         return candidate
 
