@@ -32,8 +32,6 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
-from matplotlib.patches import FancyBboxPatch
-from matplotlib.widgets import Button, Slider
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
 import rospy
@@ -65,8 +63,14 @@ class PcdMonitor:
     INTERACTION_RESTORE_DELAY_MS = 180
     MIN_VIEW_VOXELS = 8.0
     MAX_FULL_VIEW_SCALE = 4.0
+    ZOOM_SLIDER_STEPS = 10000
     TITLE_PAD_POINTS = 15.0
     EXPORT_DPI = 200
+    UI_BACKGROUND = "#f8fafc"
+    UI_SURFACE = "#ffffff"
+    UI_BORDER = "#cbd5e1"
+    UI_TEXT = "#0f172a"
+    UI_MUTED_TEXT = "#64748b"
 
     def __init__(self):
         pcd_path_param = str(rospy.get_param("~pcd_path", "")).strip()
@@ -170,9 +174,10 @@ class PcdMonitor:
             figsize=self.INITIAL_FIGURE_SIZE,
             dpi=self.FIGURE_DPI,
         )
+        self.figure.patch.set_facecolor(self.UI_BACKGROUND)
         self.figure.canvas.manager.set_window_title(self.title)
         self._configure_resizable_window()
-        self.figure.subplots_adjust(left=0.09, bottom=0.17, right=0.88, top=0.93)
+        self.figure.subplots_adjust(left=0.08, bottom=0.10, right=0.90, top=0.93)
         plot_position = self.axis.get_position()
         self.axis.set_position(
             (
@@ -226,124 +231,11 @@ class PcdMonitor:
         self.axis.set_xlabel("X (m)")
         self.axis.set_ylabel("Y (m)")
         self.axis.grid(True, color="#ffffff", linestyle="--", linewidth=0.45, alpha=0.35)
+        self._style_plot_chrome(self.axis, self.colorbar)
         self._set_axis_extent(self.bev["extent"])
 
-        button_width = 0.16
-        button_gap = 0.015
-        button_height = 0.06
-        button_y = 0.035
-        button_count = 5
-        buttons_width = (
-            button_count * button_width
-            + (button_count - 1) * button_gap
-        )
-        first_button_x = (1.0 - buttons_width) / 2.0
-        button_x_positions = [
-            first_button_x + index * (button_width + button_gap)
-            for index in range(button_count)
-        ]
-
-        rebuild_axis = self.figure.add_axes(
-            [button_x_positions[3], button_y, button_width, button_height]
-        )
-        self.rebuild_button = Button(
-            rebuild_axis,
-            "Rebuild BEV",
-            color="#2563eb",
-            hovercolor="#1d4ed8",
-        )
-        self._style_button(
-            rebuild_axis,
-            self.rebuild_button,
-            "#2563eb",
-            "#1e40af",
-        )
-        self.rebuild_button.on_clicked(self._rebuild_clicked)
-
-        reset_axis = self.figure.add_axes(
-            [button_x_positions[0], button_y, button_width, button_height]
-        )
-        self.reset_button = Button(
-            reset_axis,
-            "Reset view",
-            color="#f59e0b",
-            hovercolor="#d97706",
-        )
-        self._style_button(
-            reset_axis,
-            self.reset_button,
-            "#f59e0b",
-            "#b45309",
-        )
-        self.reset_button.on_clicked(self._reset_clicked)
-
-        save_axis = self.figure.add_axes(
-            [button_x_positions[4], button_y, button_width, button_height]
-        )
-        self.save_button = Button(
-            save_axis,
-            "Save Image",
-            color="#7c3aed",
-            hovercolor="#6d28d9",
-        )
-        self._style_button(
-            save_axis,
-            self.save_button,
-            "#7c3aed",
-            "#5b21b6",
-        )
-        self.save_button.on_clicked(self._save_clicked)
-
-        resolution_axis = self.figure.add_axes(
-            [button_x_positions[2], button_y, button_width, button_height]
-        )
-        self.resolution_button = Button(
-            resolution_axis,
-            self._resolution_button_label(),
-            color="#0891b2",
-            hovercolor="#0e7490",
-        )
-        self._style_button(
-            resolution_axis,
-            self.resolution_button,
-            "#0891b2",
-            "#155e75",
-        )
-        self.resolution_button.on_clicked(self._toggle_resolution_popup)
-        self._create_resolution_popup()
-
-        zoom_axis = self.figure.add_axes(
-            [button_x_positions[1], button_y, button_width, button_height]
-        )
-        self.zoom_button = Button(
-            zoom_axis,
-            "Zoom",
-            color="#059669",
-            hovercolor="#047857",
-        )
-        self._style_button(
-            zoom_axis,
-            self.zoom_button,
-            "#059669",
-            "#065f46",
-        )
-        self.zoom_button.on_clicked(self._toggle_zoom_slider)
-        self._create_zoom_slider()
-        self._control_button_axes = (
-            reset_axis,
-            zoom_axis,
-            resolution_axis,
-            rebuild_axis,
-            save_axis,
-        )
-        self._control_buttons = (
-            self.reset_button,
-            self.zoom_button,
-            self.resolution_button,
-            self.rebuild_button,
-            self.save_button,
-        )
-        self._layout_controls()
+        self._create_native_toolbar()
+        self._layout_figure()
 
         canvas = self.figure.canvas
         canvas.mpl_connect("scroll_event", self._on_scroll)
@@ -518,12 +410,11 @@ class PcdMonitor:
         self._schedule_full_resolution_restore()
 
     def _on_resize(self, _event):
-        self._layout_controls()
+        self._layout_figure()
         self._show_interaction_preview()
         self._schedule_full_resolution_restore()
 
     def _on_button_press(self, event):
-        self._dismiss_transient_controls_for_event(event)
         if event.inaxes is not self.axis:
             return
         if event.dblclick and event.button == 1:
@@ -569,11 +460,6 @@ class PcdMonitor:
 
     def _on_button_release(self, event):
         if self._drag_state is None:
-            if (
-                hasattr(self, "zoom_slider_axis")
-                and event.inaxes is self.zoom_slider_axis
-            ):
-                self._schedule_full_resolution_restore()
             return
 
         if event.x is not None and event.y is not None:
@@ -615,114 +501,350 @@ class PcdMonitor:
             pad=self.TITLE_PAD_POINTS,
         )
 
-    def _style_button(self, axis, button, facecolor, spine_color):
-        axis.set_facecolor(facecolor)
+    def _style_plot_chrome(self, axis, colorbar):
         for spine in axis.spines.values():
-            spine.set_color(spine_color)
-            spine.set_linewidth(2.0)
-        button.label.set_color("#ffffff")
-        button.label.set_fontsize(10)
-        button.label.set_fontweight("bold")
+            spine.set_color(self.UI_BORDER)
+            spine.set_linewidth(0.8)
+        axis.tick_params(
+            axis="both",
+            colors=self.UI_MUTED_TEXT,
+            labelsize=9,
+            length=3.5,
+            width=0.8,
+        )
+        axis.xaxis.label.set_color("#475569")
+        axis.yaxis.label.set_color("#475569")
+        axis.xaxis.label.set_fontsize(10)
+        axis.yaxis.label.set_fontsize(10)
+        axis.title.set_color(self.UI_TEXT)
+        axis.title.set_fontsize(14)
+        axis.title.set_fontweight("normal")
 
-    def _dismiss_transient_controls_for_event(self, event):
+        colorbar.outline.set_edgecolor(self.UI_BORDER)
+        colorbar.outline.set_linewidth(0.8)
+        colorbar.ax.tick_params(
+            colors=self.UI_MUTED_TEXT,
+            labelsize=8.5,
+            length=3.0,
+            width=0.8,
+        )
+        colorbar.ax.yaxis.label.set_color("#475569")
+        colorbar.ax.yaxis.label.set_fontsize(9.5)
+
+    def _create_native_toolbar(self):
+        try:
+            from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
+        except ImportError as error:
+            raise PcdError(
+                "The native pcd_monitor toolbar requires a Qt Matplotlib backend"
+            ) from error
+
+        manager = self.figure.canvas.manager
+        toolbar = getattr(manager, "toolbar", None)
+        window = getattr(manager, "window", None)
         if (
-            self._zoom_slider_visible
-            and event.inaxes not in (
-                self.zoom_slider_axis,
-                self.zoom_button.ax,
+            toolbar is None
+            or window is None
+            or not isinstance(toolbar, QtWidgets.QToolBar)
+        ):
+            raise PcdError(
+                "The native pcd_monitor toolbar requires FigureManagerQT"
             )
-        ):
-            self._set_zoom_slider_visible(False)
 
-        resolution_axes = [self.resolution_button.ax]
-        resolution_axes.extend(self._resolution_option_axes)
-        if (
-            self._resolution_popup_visible
-            and event.inaxes not in resolution_axes
-        ):
-            self._set_resolution_popup_visible(False)
+        qt_namespace = QtCore.Qt
+        tool_bar_area = getattr(
+            qt_namespace,
+            "ToolBarArea",
+            qt_namespace,
+        )
+        top_tool_bar_area = getattr(
+            tool_bar_area,
+            "TopToolBarArea",
+        )
+        tool_button_style = getattr(
+            qt_namespace,
+            "ToolButtonStyle",
+            qt_namespace,
+        )
+        text_only_style = getattr(
+            tool_button_style,
+            "ToolButtonTextOnly",
+        )
+        orientation = getattr(
+            qt_namespace,
+            "Orientation",
+            qt_namespace,
+        )
+        horizontal_orientation = getattr(
+            orientation,
+            "Horizontal",
+        )
+        alignment = getattr(
+            qt_namespace,
+            "AlignmentFlag",
+            qt_namespace,
+        )
+        right_alignment = (
+            getattr(alignment, "AlignRight")
+            | getattr(alignment, "AlignVCenter")
+        )
+        popup_mode = getattr(
+            QtWidgets.QToolButton,
+            "ToolButtonPopupMode",
+            QtWidgets.QToolButton,
+        )
+        instant_popup = getattr(popup_mode, "InstantPopup")
 
-    def _layout_controls(self):
-        figure_width = max(float(self.figure.bbox.width), 1.0)
+        window.removeToolBar(toolbar)
+        window.addToolBar(top_tool_bar_area, toolbar)
+        toolbar.clear()
+        toolbar.setObjectName("pcdMonitorToolbar")
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setToolButtonStyle(text_only_style)
+
+        self._reset_action = toolbar.addAction("Reset view")
+        self._reset_action.setToolTip("Restore the initial full BEV view")
+        self._reset_action.triggered.connect(
+            lambda _checked=False: self._reset_clicked(None)
+        )
+
+        self._zoom_tool_button = QtWidgets.QToolButton(toolbar)
+        self._zoom_tool_button.setText("Zoom")
+        self._zoom_tool_button.setPopupMode(instant_popup)
+        self._zoom_tool_button.setToolTip(
+            "Adjust the BEV zoom factor; the mouse wheel remains available"
+        )
+        zoom_menu = QtWidgets.QMenu(self._zoom_tool_button)
+        zoom_menu.setObjectName("pcdMonitorMenu")
+        zoom_content = QtWidgets.QWidget(zoom_menu)
+        zoom_content.setObjectName("pcdZoomContent")
+        zoom_layout = QtWidgets.QHBoxLayout(zoom_content)
+        zoom_layout.setContentsMargins(16, 10, 16, 10)
+        zoom_layout.setSpacing(10)
+
+        zoom_out_label = QtWidgets.QLabel("−", zoom_content)
+        zoom_out_label.setObjectName("pcdZoomBoundLabel")
+        zoom_in_label = QtWidgets.QLabel("+", zoom_content)
+        zoom_in_label.setObjectName("pcdZoomBoundLabel")
+        self._qt_zoom_slider = QtWidgets.QSlider(
+            horizontal_orientation,
+            zoom_content,
+        )
+        self._qt_zoom_slider.setObjectName("pcdZoomSlider")
+        self._qt_zoom_slider.setRange(0, self.ZOOM_SLIDER_STEPS)
+        self._qt_zoom_slider.setSingleStep(1)
+        self._qt_zoom_slider.setPageStep(100)
+        self._qt_zoom_slider.setMinimumWidth(420)
+        self._qt_zoom_value_label = QtWidgets.QLabel(zoom_content)
+        self._qt_zoom_value_label.setObjectName("pcdZoomValue")
+        self._qt_zoom_value_label.setFixedWidth(58)
+        self._qt_zoom_value_label.setAlignment(right_alignment)
+
+        zoom_layout.addWidget(zoom_out_label)
+        zoom_layout.addWidget(self._qt_zoom_slider, 1)
+        zoom_layout.addWidget(zoom_in_label)
+        zoom_layout.addWidget(self._qt_zoom_value_label)
+        zoom_content.setMinimumWidth(560)
+
+        zoom_widget_action = QtWidgets.QWidgetAction(zoom_menu)
+        zoom_widget_action.setDefaultWidget(zoom_content)
+        zoom_menu.addAction(zoom_widget_action)
+        self._zoom_tool_button.setMenu(zoom_menu)
+        toolbar.addWidget(self._zoom_tool_button)
+        self._qt_zoom_menu = zoom_menu
+        self._qt_zoom_widget_action = zoom_widget_action
+
+        self._resolution_tool_button = QtWidgets.QToolButton(toolbar)
+        self._resolution_tool_button.setText("Resolution")
+        self._resolution_tool_button.setPopupMode(instant_popup)
+        self._resolution_tool_button.setToolTip(
+            "Select the resolution used by the next BEV rebuild"
+        )
+        resolution_menu = QtWidgets.QMenu(self._resolution_tool_button)
+        resolution_menu.setObjectName("pcdMonitorMenu")
+        action_group_class = (
+            getattr(QtGui, "QActionGroup", None)
+            or getattr(QtWidgets, "QActionGroup")
+        )
+        self._resolution_action_group = action_group_class(resolution_menu)
+        self._resolution_action_group.setExclusive(True)
+        self._resolution_actions = {}
+        for width, height in self.BEV_RESOLUTIONS:
+            action = resolution_menu.addAction(
+                "{} × {}".format(width, height)
+            )
+            action.setCheckable(True)
+            action.setChecked(
+                width == self.selected_bev_width
+                and height == self.selected_bev_height
+            )
+            action.triggered.connect(
+                lambda _checked=False,
+                selected_width=width,
+                selected_height=height:
+                self._select_bev_resolution(
+                    selected_width,
+                    selected_height,
+                )
+            )
+            self._resolution_action_group.addAction(action)
+            self._resolution_actions[(width, height)] = action
+        self._resolution_tool_button.setMenu(resolution_menu)
+        toolbar.addWidget(self._resolution_tool_button)
+        self._qt_resolution_menu = resolution_menu
+
+        toolbar.addSeparator()
+        self._save_action = toolbar.addAction("Save Image")
+        self._save_action.setToolTip(
+            "Save the current BEV, title and colorbar beside the PCD file"
+        )
+        self._save_action.triggered.connect(
+            lambda _checked=False: self._save_clicked(None)
+        )
+
+        self._rebuild_action = toolbar.addAction("Rebuild BEV")
+        self._rebuild_action.setToolTip(
+            "Rebuild at the selected resolution for the current view"
+        )
+        self._rebuild_action.triggered.connect(
+            lambda _checked=False: self._rebuild_clicked(None)
+        )
+        rebuild_widget = toolbar.widgetForAction(self._rebuild_action)
+        if rebuild_widget is not None:
+            rebuild_widget.setObjectName("pcdPrimaryToolButton")
+
+        toolbar.setStyleSheet(
+            """
+            QToolBar#pcdMonitorToolbar {
+                background: #ffffff;
+                border: none;
+                border-bottom: 1px solid #e2e8f0;
+                spacing: 4px;
+                padding: 6px 10px;
+            }
+            QToolBar#pcdMonitorToolbar QToolButton {
+                color: #334155;
+                background: transparent;
+                border: none;
+                border-radius: 7px;
+                padding: 7px 11px;
+                font-weight: 600;
+            }
+            QToolBar#pcdMonitorToolbar QToolButton:hover,
+            QToolBar#pcdMonitorToolbar QToolButton:pressed {
+                color: #4338ca;
+                background: #eef2ff;
+            }
+            QToolBar#pcdMonitorToolbar QToolButton#pcdPrimaryToolButton {
+                color: #ffffff;
+                background: #4f46e5;
+                padding-left: 15px;
+                padding-right: 15px;
+            }
+            QToolBar#pcdMonitorToolbar
+            QToolButton#pcdPrimaryToolButton:hover,
+            QToolBar#pcdMonitorToolbar
+            QToolButton#pcdPrimaryToolButton:pressed {
+                color: #ffffff;
+                background: #4338ca;
+            }
+            QToolBar#pcdMonitorToolbar QToolBarSeparator {
+                background: #e2e8f0;
+                width: 1px;
+                margin: 7px 6px;
+            }
+            QMenu#pcdMonitorMenu {
+                color: #334155;
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QMenu#pcdMonitorMenu::item {
+                border-radius: 6px;
+                padding: 8px 28px 8px 10px;
+            }
+            QMenu#pcdMonitorMenu::item:selected {
+                color: #4338ca;
+                background: #eef2ff;
+            }
+            QWidget#pcdZoomContent {
+                background: #ffffff;
+            }
+            QLabel#pcdZoomBoundLabel {
+                color: #64748b;
+                font-size: 15px;
+                font-weight: 600;
+            }
+            QLabel#pcdZoomValue {
+                color: #475569;
+                font-weight: 600;
+            }
+            QSlider#pcdZoomSlider::groove:horizontal {
+                height: 4px;
+                background: #d8dee8;
+                border-radius: 2px;
+            }
+            QSlider#pcdZoomSlider::sub-page:horizontal {
+                background: #4f46e5;
+                border-radius: 2px;
+            }
+            QSlider#pcdZoomSlider::add-page:horizontal {
+                background: #d8dee8;
+                border-radius: 2px;
+            }
+            QSlider#pcdZoomSlider::handle:horizontal {
+                width: 14px;
+                margin: -5px 0;
+                background: #ffffff;
+                border: 2px solid #4f46e5;
+                border-radius: 7px;
+            }
+            """
+        )
+        toolbar.setVisible(True)
+        self._native_toolbar = toolbar
+
+        self._updating_zoom_slider = True
+        try:
+            slider_value = self._view_width_to_slider_value(
+                abs(self.axis.get_xlim()[1] - self.axis.get_xlim()[0])
+            )
+            self._qt_zoom_slider.setValue(
+                int(round(slider_value * self.ZOOM_SLIDER_STEPS))
+            )
+        finally:
+            self._updating_zoom_slider = False
+        self._set_zoom_slider_value_text(
+            abs(self.axis.get_xlim()[1] - self.axis.get_xlim()[0])
+        )
+        self._qt_zoom_slider.valueChanged.connect(
+            self._zoom_slider_changed
+        )
+        self._qt_zoom_slider.sliderReleased.connect(
+            self._zoom_slider_released
+        )
+        zoom_menu.aboutToShow.connect(
+            self._sync_zoom_slider_to_current_view
+        )
+
+        rospy.loginfo(
+            "Installed native Qt toolbar: Reset | Zoom | Resolution | "
+            "Save | Rebuild"
+        )
+
+    def _layout_figure(self):
         figure_height = max(float(self.figure.bbox.height), 1.0)
-        button_y = 0.035
-        button_height = max(0.06, 30.0 / figure_height)
-        slider_gap = 8.0 / figure_height
-        slider_height = 16.0 / figure_height
-
-        for button_axis in self._control_button_axes:
-            position = button_axis.get_position()
-            button_axis.set_position(
-                [position.x0, button_y, position.width, button_height]
-            )
-
-        button_top = button_y + button_height
-        slider_y = button_top + slider_gap
-        self.zoom_slider_axis.set_position(
-            [0.18, slider_y, 0.64, slider_height]
+        plot_bottom = min(
+            0.14,
+            max(0.09, 76.0 / figure_height),
         )
-
-        resolution_position = self.resolution_button.ax.get_position()
-        option_height_pixels = min(
-            48.0,
-            max(34.0, 0.042 * figure_height),
-        )
-        option_height = option_height_pixels / figure_height
-        popup_width = max(
-            200.0 / figure_width,
-            min(resolution_position.width, 280.0 / figure_width),
-        )
-        popup_padding_x = 6.0 / figure_width
-        popup_padding_y = 6.0 / figure_height
-        option_width = popup_width - 2.0 * popup_padding_x
-        popup_height = (
-            len(self._resolution_option_axes) * option_height
-            + 2.0 * popup_padding_y
-        )
-        popup_x = min(
-            1.0 - popup_width - 4.0 / figure_width,
-            max(
-                4.0 / figure_width,
-                resolution_position.x0
-                + 0.5 * (resolution_position.width - popup_width),
-            ),
-        )
-        popup_y = resolution_position.y1 + slider_gap
-        for option_index, option_axis in enumerate(
-            self._resolution_option_axes
-        ):
-            option_axis.set_position(
-                [
-                    popup_x + popup_padding_x,
-                    popup_y
-                    + popup_padding_y
-                    + (
-                        len(self._resolution_option_axes)
-                        - option_index
-                        - 1
-                    ) * option_height,
-                    option_width,
-                    option_height,
-                ]
-            )
-        self._resolution_popup_panel.set_bounds(
-            popup_x,
-            popup_y,
-            popup_width,
-            popup_height,
-        )
-        self._resolution_popup_shadow.set_bounds(
-            popup_x + 2.0 / figure_width,
-            popup_y - 2.0 / figure_height,
-            popup_width,
-            popup_height,
-        )
-
         plot_top = min(0.93, 1.0 - 35.0 / figure_height)
         self.figure.subplots_adjust(
-            left=0.09,
-            bottom=0.17,
-            right=0.88,
+            left=0.08,
+            bottom=plot_bottom,
+            right=0.90,
             top=plot_top,
         )
         plot_position = self.axis.get_position()
@@ -734,176 +856,12 @@ class PcdMonitor:
                 plot_position.height,
             )
         )
-        self._apply_adaptive_button_fonts()
-
-    def _apply_adaptive_button_fonts(self):
-        figure_height = max(float(self.figure.bbox.height), 1.0)
-        default_figure_height = (
-            self.INITIAL_FIGURE_SIZE[1] * self.FIGURE_DPI
-        )
-
-        button_height_pixels = max(0.06 * figure_height, 30.0)
-        default_button_height_pixels = 0.06 * default_figure_height
-        button_font_size = min(
-            13.0,
-            max(
-                8.0,
-                10.0 * button_height_pixels / default_button_height_pixels,
-            ),
-        )
-        for button in self._control_buttons:
-            button.label.set_fontsize(button_font_size)
-
-        option_height_pixels = max(0.042 * figure_height, 24.0)
-        default_option_height_pixels = 0.042 * default_figure_height
-        option_font_size = min(
-            13.0,
-            max(
-                8.0,
-                10.0 * option_height_pixels / default_option_height_pixels,
-            ),
-        )
-        for (
-            option_button,
-            _width,
-            _height,
-            selection_indicator,
-        ) in self._resolution_option_buttons:
-            option_button.label.set_fontsize(option_font_size)
-            selection_indicator.set_fontsize(option_font_size + 1.0)
-
-    def _resolution_button_label(self):
-        return "Resolution"
-
-    def _style_resolution_option(
-        self,
-        option_button,
-        selection_indicator,
-        is_selected,
-    ):
-        if is_selected:
-            facecolor = "#ecfeff"
-            hovercolor = "#cffafe"
-            text_color = "#0e7490"
-        else:
-            facecolor = "#ffffff"
-            hovercolor = "#f1f5f9"
-            text_color = "#334155"
-
-        option_button.color = facecolor
-        option_button.hovercolor = hovercolor
-        option_button.ax.set_facecolor(facecolor)
-        for spine in option_button.ax.spines.values():
-            spine.set_visible(False)
-        option_button.label.set_color(text_color)
-        option_button.label.set_fontweight(
-            "bold" if is_selected else "normal"
-        )
-        option_button.label.set_horizontalalignment("left")
-        option_button.label.set_position((0.08, 0.5))
-        selection_indicator.set_visible(is_selected)
-
-    def _create_resolution_popup(self):
-        self._resolution_popup_visible = False
-        self._resolution_option_axes = []
-        self._resolution_option_buttons = []
-
-        self._resolution_popup_shadow = FancyBboxPatch(
-            (0.0, 0.0),
-            0.0,
-            0.0,
-            boxstyle="round,pad=0.004,rounding_size=0.008",
-            transform=self.figure.transFigure,
-            facecolor="#0f172a",
-            edgecolor="none",
-            alpha=0.14,
-            zorder=18,
-            visible=False,
-        )
-        self.figure.add_artist(self._resolution_popup_shadow)
-        self._resolution_popup_panel = FancyBboxPatch(
-            (0.0, 0.0),
-            0.0,
-            0.0,
-            boxstyle="round,pad=0.004,rounding_size=0.008",
-            transform=self.figure.transFigure,
-            facecolor="#ffffff",
-            edgecolor="#cbd5e1",
-            linewidth=0.8,
-            zorder=19,
-            visible=False,
-        )
-        self.figure.add_artist(self._resolution_popup_panel)
-
-        for width, height in self.BEV_RESOLUTIONS:
-            option_axis = self.figure.add_axes(
-                [0.0, 0.0, 0.1, 0.042]
-            )
-            option_axis.set_zorder(20)
-            is_selected = (
-                width == self.selected_bev_width
-                and height == self.selected_bev_height
-            )
-            option_button = Button(
-                option_axis,
-                "{} × {}".format(width, height),
-                color="#ffffff",
-                hovercolor="#f1f5f9",
-            )
-            selection_indicator = option_axis.text(
-                0.90,
-                0.5,
-                "✓",
-                transform=option_axis.transAxes,
-                color="#0891b2",
-                fontsize=11,
-                fontweight="bold",
-                horizontalalignment="center",
-                verticalalignment="center",
-            )
-            self._style_resolution_option(
-                option_button,
-                selection_indicator,
-                is_selected,
-            )
-            option_button.on_clicked(
-                lambda _event, selected_width=width, selected_height=height:
-                self._select_bev_resolution(selected_width, selected_height)
-            )
-            option_axis.set_visible(False)
-            self._resolution_option_axes.append(option_axis)
-            self._resolution_option_buttons.append(
-                (
-                    option_button,
-                    width,
-                    height,
-                    selection_indicator,
-                )
-            )
-
-    def _toggle_resolution_popup(self, _event):
-        visible = not self._resolution_popup_visible
-        if visible:
-            self._set_zoom_slider_visible(False)
-        self._set_resolution_popup_visible(visible)
-
-    def _set_resolution_popup_visible(self, visible):
-        self._resolution_popup_visible = bool(visible)
-        self._resolution_popup_shadow.set_visible(
-            self._resolution_popup_visible
-        )
-        self._resolution_popup_panel.set_visible(
-            self._resolution_popup_visible
-        )
-        for option_axis in self._resolution_option_axes:
-            option_axis.set_visible(self._resolution_popup_visible)
-        self.figure.canvas.draw_idle()
 
     def _select_bev_resolution(self, width, height):
         self.selected_bev_width = width
         self.selected_bev_height = height
-        self._update_resolution_option_styles()
-        self._set_resolution_popup_visible(False)
+        for resolution, action in self._resolution_actions.items():
+            action.setChecked(resolution == (width, height))
         rospy.loginfo(
             "Selected BEV rebuild resolution: %d x %d; "
             "click Rebuild BEV to apply",
@@ -911,85 +869,8 @@ class PcdMonitor:
             height,
         )
 
-    def _update_resolution_option_styles(self):
-        for (
-            option_button,
-            width,
-            height,
-            selection_indicator,
-        ) in self._resolution_option_buttons:
-            is_selected = (
-                width == self.selected_bev_width
-                and height == self.selected_bev_height
-            )
-            self._style_resolution_option(
-                option_button,
-                selection_indicator,
-                is_selected,
-            )
-        self._apply_adaptive_button_fonts()
-
-    def _create_zoom_slider(self):
-        self._zoom_slider_visible = False
-        self._updating_zoom_slider = False
-        self.zoom_slider_axis = self.figure.add_axes(
-            [0.18, 0.085, 0.64, 0.022]
-        )
-        self.zoom_slider_axis.set_zorder(20)
-        self.zoom_slider = Slider(
-            self.zoom_slider_axis,
-            "Zoom",
-            0.0,
-            1.0,
-            valinit=self._view_width_to_slider_value(self.full_view_width),
-            valfmt="%1.2f",
-            color="#059669",
-            track_color="#d1d5db",
-            initcolor="none",
-            handle_style={
-                "facecolor": "#059669",
-                "edgecolor": "#065f46",
-                "size": 6,
-            },
-        )
-        self.zoom_slider.track.set_visible(False)
-        self.zoom_slider.poly.set_visible(False)
-        self.zoom_slider.vline.set_visible(False)
-        (self._zoom_slider_track_line,) = self.zoom_slider_axis.plot(
-            [0.0, 1.0],
-            [0.5, 0.5],
-            transform=self.zoom_slider_axis.transAxes,
-            color="#d1d5db",
-            linewidth=4.0,
-            solid_capstyle="round",
-            zorder=1,
-        )
-        (self._zoom_slider_fill_line,) = self.zoom_slider_axis.plot(
-            [0.0, self.zoom_slider.val],
-            [0.5, 0.5],
-            transform=self.zoom_slider_axis.transAxes,
-            color="#059669",
-            linewidth=4.0,
-            solid_capstyle="round",
-            zorder=2,
-        )
-        self.zoom_slider._handle.set_zorder(3)
-        self.zoom_slider_axis.set_visible(False)
-        self._sync_zoom_slider_to_current_view()
-        self.zoom_slider.on_changed(self._zoom_slider_changed)
-
-    def _toggle_zoom_slider(self, _event):
-        visible = not self._zoom_slider_visible
-        if visible:
-            self._set_resolution_popup_visible(False)
-        self._set_zoom_slider_visible(visible)
-
-    def _set_zoom_slider_visible(self, visible):
-        self._zoom_slider_visible = bool(visible)
-        self.zoom_slider_axis.set_visible(self._zoom_slider_visible)
-        if self._zoom_slider_visible:
-            self._sync_zoom_slider_to_current_view()
-        self.figure.canvas.draw_idle()
+    def _zoom_slider_released(self):
+        self._schedule_full_resolution_restore()
 
     def _view_width_to_slider_value(self, view_width):
         bounded_width = min(
@@ -1008,11 +889,13 @@ class PcdMonitor:
         )
         return self.max_view_width * math.exp(-value * logarithmic_range)
 
-    def _zoom_slider_changed(self, slider_value):
+    def _zoom_slider_changed(self, slider_position):
         if self._updating_zoom_slider:
             return
 
-        self._update_zoom_slider_fill(slider_value)
+        slider_value = (
+            float(slider_position) / float(self.ZOOM_SLIDER_STEPS)
+        )
 
         x_min, x_max = self.axis.get_xlim()
         y_min, y_max = self.axis.get_ylim()
@@ -1037,33 +920,28 @@ class PcdMonitor:
         self._schedule_full_resolution_restore()
 
     def _sync_zoom_slider_to_current_view(self):
-        if not hasattr(self, "zoom_slider"):
+        if not hasattr(self, "_qt_zoom_slider"):
             return
 
         x_min, x_max = self.axis.get_xlim()
         view_width = abs(x_max - x_min)
         slider_value = self._view_width_to_slider_value(view_width)
-        if not math.isclose(
-            self.zoom_slider.val,
-            slider_value,
-            rel_tol=1e-12,
-            abs_tol=1e-12,
-        ):
+        slider_position = int(
+            round(slider_value * self.ZOOM_SLIDER_STEPS)
+        )
+        if self._qt_zoom_slider.value() != slider_position:
             self._updating_zoom_slider = True
             try:
-                self.zoom_slider.set_val(slider_value)
+                self._qt_zoom_slider.setValue(slider_position)
             finally:
                 self._updating_zoom_slider = False
-        self._update_zoom_slider_fill(slider_value)
         self._set_zoom_slider_value_text(view_width)
-
-    def _update_zoom_slider_fill(self, slider_value):
-        value = min(1.0, max(0.0, float(slider_value)))
-        self._zoom_slider_fill_line.set_xdata([0.0, value])
 
     def _set_zoom_slider_value_text(self, view_width):
         zoom_factor = self.full_view_width / float(view_width)
-        self.zoom_slider.valtext.set_text("{:.2f}x".format(zoom_factor))
+        self._qt_zoom_value_label.setText(
+            "{:.2f}×".format(zoom_factor)
+        )
 
     def _show_interaction_preview(self):
         if (
@@ -1088,8 +966,8 @@ class PcdMonitor:
         if (
             self._drag_state is not None
             or (
-                hasattr(self, "zoom_slider")
-                and self.zoom_slider.drag_active
+                hasattr(self, "_qt_zoom_slider")
+                and self._qt_zoom_slider.isSliderDown()
             )
         ):
             return
@@ -1104,8 +982,9 @@ class PcdMonitor:
         self._restore_full_bev()
 
     def _save_clicked(self, _event):
-        self.save_button.label.set_text("Saving...")
-        self.figure.canvas.draw()
+        self._save_action.setText("Saving…")
+        self._save_action.setEnabled(False)
+        self.figure.canvas.flush_events()
         try:
             output_path = self._next_export_path()
             self._save_bev_image(output_path)
@@ -1114,8 +993,8 @@ class PcdMonitor:
         else:
             rospy.loginfo("Saved PCD BEV image: %s", output_path)
         finally:
-            self.save_button.label.set_text("Save Image")
-            self.figure.canvas.draw_idle()
+            self._save_action.setText("Save Image")
+            self._save_action.setEnabled(True)
 
     def _next_export_path(self):
         filename_stem = self.pcd_path.stem
@@ -1204,6 +1083,7 @@ class PcdMonitor:
             linewidth=0.45,
             alpha=0.35,
         )
+        self._style_plot_chrome(export_axis, export_colorbar)
         export_axis.set_xlim(self.axis.get_xlim())
         export_axis.set_ylim(self.axis.get_ylim())
         return export_figure
@@ -1231,8 +1111,9 @@ class PcdMonitor:
             padding_ratio=0.0,
         )
 
-        self.rebuild_button.label.set_text("Rebuilding...")
-        self.figure.canvas.draw()
+        self._rebuild_action.setText("Rebuilding…")
+        self._rebuild_action.setEnabled(False)
+        self.figure.canvas.flush_events()
         try:
             bev = build_bev(
                 self.sampled_xyz,
@@ -1247,7 +1128,8 @@ class PcdMonitor:
             self._apply_bev(bev)
             self._log_bev_info("Rebuilt BEV", bev)
         finally:
-            self.rebuild_button.label.set_text("Rebuild BEV")
+            self._rebuild_action.setText("Rebuild BEV")
+            self._rebuild_action.setEnabled(True)
             self.figure.canvas.draw_idle()
 
     def _restore_full_bev(self):
