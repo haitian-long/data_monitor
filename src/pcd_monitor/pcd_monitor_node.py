@@ -5,7 +5,6 @@ import math
 import os
 from pathlib import Path
 import sys
-import time
 
 
 def _prefer_xcb_on_wslg():
@@ -30,6 +29,7 @@ WSLG_XCB_ENABLED = _prefer_xcb_on_wslg()
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
@@ -57,9 +57,6 @@ class PcdMonitor:
     BEV_ASPECT_RATIO = float(BEV_WIDTH) / float(BEV_HEIGHT)
     INITIAL_FIGURE_SIZE = (12.8, 7.2)
     FIGURE_DPI = 100
-    INTERACTION_PREVIEW_WIDTH = 1280
-    INTERACTION_PREVIEW_HEIGHT = 720
-    DRAG_FRAME_INTERVAL = 1.0 / 30.0
     INTERACTION_RESTORE_DELAY_MS = 180
     MIN_VIEW_VOXELS = 8.0
     MAX_FULL_VIEW_SCALE = 4.0
@@ -163,10 +160,12 @@ class PcdMonitor:
             grid_height=self.BEV_HEIGHT,
             dataset_stats=self.dataset_stats,
         )
+        self._build_bev_image(self.bev)
         self.full_bev = self.bev
         self._log_bev_info("Initial BEV", self.bev)
 
         self._drag_state = None
+        self._interaction_active = False
         self._create_figure()
 
     def _create_figure(self):
@@ -188,30 +187,17 @@ class PcdMonitor:
             )
         )
 
-        self._prepare_image_grids(self.bev)
-        preview_height, preview_width = self._interaction_preview_grid.shape
-        rospy.loginfo(
-            "Interaction preview: %d x %d max-Z pooled BEV, "
-            "drag refresh limited to %.0f FPS",
-            preview_width,
-            preview_height,
-            1.0 / self.DRAG_FRAME_INTERVAL,
-        )
-
         colormap = copy.copy(plt.get_cmap(self.colormap))
         colormap.set_bad(color="#f3f4f6", alpha=1.0)
         self.image = self.axis.imshow(
-            self._full_image_grid,
-            origin="lower",
+            self.bev["rgba_image"],
+            origin="upper",
             extent=self.bev["extent"],
             interpolation="nearest",
             resample=False,
-            cmap=colormap,
-            norm=self._normalization_for_bev(self.bev),
             aspect="equal",
         )
         self.trajectory_line = self._draw_trajectory(self.axis)
-        self._using_interaction_preview = False
         # Keep the BEV axes centered in the Figure. A normal colorbar with
         # ax=self.axis shrinks the main axes toward the left.
         self.axis.set_anchor("C")
@@ -224,7 +210,15 @@ class PcdMonitor:
             bbox_transform=self.axis.transAxes,
             borderpad=0.0,
         )
-        self.colorbar = self.figure.colorbar(self.image, cax=self.colorbar_axis)
+        self.color_mappable = ScalarMappable(
+            norm=self._normalization_for_bev(self.bev),
+            cmap=colormap,
+        )
+        self.color_mappable.set_array([])
+        self.colorbar = self.figure.colorbar(
+            self.color_mappable,
+            cax=self.colorbar_axis,
+        )
         self.colorbar.set_label("Maximum Z in pixel (m), fixed P1-P99")
 
         self._set_plot_title()
@@ -236,6 +230,8 @@ class PcdMonitor:
 
         self._create_native_toolbar()
         self._layout_figure()
+        self._create_interaction_overlay()
+        self._bev_qpixmap(self.bev)
 
         canvas = self.figure.canvas
         canvas.mpl_connect("scroll_event", self._on_scroll)
@@ -250,10 +246,19 @@ class PcdMonitor:
         )
         self._interaction_restore_timer.single_shot = True
         self._interaction_restore_timer.add_callback(
-            self._restore_full_resolution_after_interaction
+            self._finish_interaction
+        )
+        # Prepare the hidden Matplotlib buffer once, then keep the Qt-rendered
+        # plot layer visible for the entire lifetime of the window.
+        canvas.draw()
+        self._show_persistent_overlay()
+        rospy.loginfo(
+            "Persistent Qt BEV renderer enabled; Matplotlib remains "
+            "synchronized in the background for export"
         )
         rospy.loginfo(
-            "Zoom X-span limits: %.6g..%.6g m; full-resolution restore delay: %d ms",
+            "Zoom X-span limits: %.6g..%.6g m; cached-image interaction "
+            "commit delay: %d ms",
             self.min_view_width,
             self.max_view_width,
             self.INTERACTION_RESTORE_DELAY_MS,
@@ -396,7 +401,7 @@ class PcdMonitor:
         applied_zoom_factor = new_width / current_width
         new_height = current_height * applied_zoom_factor
 
-        self._show_interaction_preview()
+        self._begin_interaction()
         self.axis.set_xlim(
             event.xdata - relative_x * new_width,
             event.xdata + (1.0 - relative_x) * new_width,
@@ -406,13 +411,16 @@ class PcdMonitor:
             event.ydata + (1.0 - relative_y) * new_height,
         )
         self._sync_zoom_slider_to_current_view()
-        self.figure.canvas.draw_idle()
-        self._schedule_full_resolution_restore()
+        self._update_interaction_overlay()
+        self._schedule_interaction_finish()
 
     def _on_resize(self, _event):
+        self._cancel_interaction()
         self._layout_figure()
-        self._show_interaction_preview()
-        self._schedule_full_resolution_restore()
+        self.figure.canvas.draw_idle()
+        self._update_interaction_overlay_geometry()
+        self._interaction_overlay.raise_()
+        self._interaction_overlay.update()
 
     def _on_button_press(self, event):
         if event.inaxes is not self.axis:
@@ -436,10 +444,9 @@ class PcdMonitor:
                     max(float(self.axis.bbox.width), 1.0),
                     max(float(self.axis.bbox.height), 1.0),
                 ),
-                "last_draw_time": 0.0,
             }
             self._interaction_restore_timer.stop()
-            self._show_interaction_preview()
+            self._begin_interaction()
 
     def _on_motion(self, event):
         if (
@@ -449,14 +456,9 @@ class PcdMonitor:
         ):
             return
 
-        now = time.monotonic()
-        if now - self._drag_state["last_draw_time"] < self.DRAG_FRAME_INTERVAL:
-            return
-
         x_limits, y_limits = self._drag_limits_for_event(event)
         self._set_axis_limits(x_limits, y_limits)
-        self._drag_state["last_draw_time"] = now
-        self.figure.canvas.draw_idle()
+        self._update_interaction_overlay()
 
     def _on_button_release(self, event):
         if self._drag_state is None:
@@ -467,8 +469,7 @@ class PcdMonitor:
             self._set_axis_limits(x_limits, y_limits)
 
         self._drag_state = None
-        self._show_full_resolution()
-        self.figure.canvas.draw_idle()
+        self._finish_interaction(force=True)
 
     def _drag_limits_for_event(self, event):
         start_x, start_y = self._drag_state["start_pixel"]
@@ -857,6 +858,578 @@ class PcdMonitor:
             )
         )
 
+    def _create_interaction_overlay(self):
+        from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
+
+        monitor = self
+
+        class PersistentCachedBevOverlay(QtWidgets.QWidget):
+            def __init__(self, parent):
+                super().__init__(parent)
+                widget_attributes = getattr(
+                    QtCore.Qt,
+                    "WidgetAttribute",
+                    QtCore.Qt,
+                )
+                self.setAttribute(
+                    getattr(widget_attributes, "WA_TransparentForMouseEvents"),
+                    True,
+                )
+                self.setAttribute(
+                    getattr(widget_attributes, "WA_OpaquePaintEvent"),
+                    True,
+                )
+                self.hide()
+
+            def paintEvent(self, _event):
+                painter = QtGui.QPainter(self)
+                monitor._paint_interaction_overlay(painter, self)
+                painter.end()
+
+        self._qt_core = QtCore
+        self._qt_gui = QtGui
+        self._interaction_overlay = PersistentCachedBevOverlay(
+            self.figure.canvas
+        )
+        self._interaction_data_rect = QtCore.QRectF()
+        self._trajectory_qpath = self._build_trajectory_qpath()
+
+        alignments = getattr(
+            QtCore.Qt,
+            "AlignmentFlag",
+            QtCore.Qt,
+        )
+        self._qt_align_center = getattr(alignments, "AlignCenter")
+        self._qt_align_right_center = (
+            getattr(alignments, "AlignRight")
+            | getattr(alignments, "AlignVCenter")
+        )
+        self._qt_align_bottom_center = (
+            getattr(alignments, "AlignHCenter")
+            | getattr(alignments, "AlignBottom")
+        )
+
+    def _update_interaction_overlay_geometry(self):
+        canvas = self.figure.canvas
+        figure_width = max(float(self.figure.bbox.width), 1.0)
+        figure_height = max(float(self.figure.bbox.height), 1.0)
+        scale_x = float(canvas.width()) / figure_width
+        scale_y = float(canvas.height()) / figure_height
+
+        axis_left = float(self.axis.bbox.x0) * scale_x
+        axis_right = float(self.axis.bbox.x1) * scale_x
+        axis_top = (
+            figure_height - float(self.axis.bbox.y1)
+        ) * scale_y
+        axis_bottom = (
+            figure_height - float(self.axis.bbox.y0)
+        ) * scale_y
+
+        renderer = canvas.get_renderer()
+        tight_bbox = self.axis.get_tightbbox(renderer)
+        tight_left = float(tight_bbox.x0) * scale_x
+        tight_right = float(tight_bbox.x1) * scale_x
+        tight_top = (
+            figure_height - float(tight_bbox.y1)
+        ) * scale_y
+        tight_bottom = (
+            figure_height - float(tight_bbox.y0)
+        ) * scale_y
+
+        overlay_left = max(
+            0.0,
+            min(tight_left - 6.0, axis_left - 100.0),
+        )
+        overlay_top = max(
+            0.0,
+            min(tight_top - 6.0, axis_top - 50.0),
+        )
+        overlay_right = min(
+            float(canvas.width()),
+            max(tight_right + 6.0, axis_right + 4.0),
+        )
+        overlay_bottom = min(
+            float(canvas.height()),
+            max(tight_bottom + 6.0, axis_bottom + 64.0),
+        )
+
+        # Keep the independently rendered colorbar visible beside the
+        # interaction layer.
+        colorbar_left = float(self.colorbar_axis.bbox.x0) * scale_x
+        if colorbar_left > axis_right:
+            overlay_right = min(overlay_right, colorbar_left - 2.0)
+
+        geometry = self._qt_core.QRect(
+            int(math.floor(overlay_left)),
+            int(math.floor(overlay_top)),
+            max(1, int(math.ceil(overlay_right - overlay_left))),
+            max(1, int(math.ceil(overlay_bottom - overlay_top))),
+        )
+        self._interaction_overlay.setGeometry(geometry)
+        self._interaction_data_rect = self._qt_core.QRectF(
+            axis_left - geometry.x(),
+            axis_top - geometry.y(),
+            axis_right - axis_left,
+            axis_bottom - axis_top,
+        )
+
+    def _paint_interaction_overlay(self, painter, widget):
+        painter.fillRect(
+            widget.rect(),
+            self._qt_gui.QColor(self.UI_BACKGROUND),
+        )
+        data_rect = self._interaction_data_rect
+        if data_rect.width() <= 0.0 or data_rect.height() <= 0.0:
+            return
+
+        painter.fillRect(
+            data_rect,
+            self._qt_gui.QColor("#ffffff"),
+        )
+        render_hints = getattr(
+            self._qt_gui.QPainter,
+            "RenderHint",
+            self._qt_gui.QPainter,
+        )
+        painter.setRenderHint(
+            getattr(render_hints, "SmoothPixmapTransform"),
+            False,
+        )
+        self._draw_cached_bev_image(painter, data_rect)
+
+        x_ticks, x_labels, x_offset = self._interaction_axis_ticks(
+            self.axis.xaxis
+        )
+        y_ticks, y_labels, y_offset = self._interaction_axis_ticks(
+            self.axis.yaxis
+        )
+        self._draw_interaction_grid(
+            painter,
+            data_rect,
+            x_ticks,
+            y_ticks,
+        )
+        self._draw_interaction_trajectory(painter, data_rect)
+        self._draw_interaction_axes(
+            painter,
+            data_rect,
+            x_ticks,
+            x_labels,
+            x_offset,
+            y_ticks,
+            y_labels,
+            y_offset,
+        )
+
+    def _draw_cached_bev_image(self, painter, data_rect):
+        pixmap = self._bev_qpixmap(self.bev)
+        image_min_x, image_max_x, image_min_y, image_max_y = self.bev[
+            "extent"
+        ]
+        view_min_x, view_max_x = self.axis.get_xlim()
+        view_min_y, view_max_y = self.axis.get_ylim()
+        visible_min_x = max(image_min_x, view_min_x)
+        visible_max_x = min(image_max_x, view_max_x)
+        visible_min_y = max(image_min_y, view_min_y)
+        visible_max_y = min(image_max_y, view_max_y)
+        if (
+            visible_max_x <= visible_min_x
+            or visible_max_y <= visible_min_y
+        ):
+            return
+
+        view_width = view_max_x - view_min_x
+        view_height = view_max_y - view_min_y
+        image_width = image_max_x - image_min_x
+        image_height = image_max_y - image_min_y
+        target_rect = self._qt_core.QRectF(
+            data_rect.left()
+            + (visible_min_x - view_min_x)
+            / view_width
+            * data_rect.width(),
+            data_rect.top()
+            + (view_max_y - visible_max_y)
+            / view_height
+            * data_rect.height(),
+            (visible_max_x - visible_min_x)
+            / view_width
+            * data_rect.width(),
+            (visible_max_y - visible_min_y)
+            / view_height
+            * data_rect.height(),
+        )
+        source_rect = self._qt_core.QRectF(
+            (visible_min_x - image_min_x)
+            / image_width
+            * pixmap.width(),
+            (image_max_y - visible_max_y)
+            / image_height
+            * pixmap.height(),
+            (visible_max_x - visible_min_x)
+            / image_width
+            * pixmap.width(),
+            (visible_max_y - visible_min_y)
+            / image_height
+            * pixmap.height(),
+        )
+        painter.drawPixmap(target_rect, pixmap, source_rect)
+
+    def _bev_qpixmap(self, bev):
+        cached_pixmap = bev.get("qt_pixmap")
+        if cached_pixmap is not None:
+            return cached_pixmap
+
+        rgba = bev["rgba_image"]
+        image_formats = getattr(
+            self._qt_gui.QImage,
+            "Format",
+            self._qt_gui.QImage,
+        )
+        image = self._qt_gui.QImage(
+            rgba.data,
+            rgba.shape[1],
+            rgba.shape[0],
+            rgba.strides[0],
+            getattr(image_formats, "Format_RGBA8888"),
+        )
+        pixmap = self._qt_gui.QPixmap.fromImage(image)
+        bev["qt_pixmap"] = pixmap
+        return pixmap
+
+    def _interaction_axis_ticks(self, matplotlib_axis):
+        locations = np.asarray(
+            matplotlib_axis.get_majorticklocs(),
+            dtype=np.float64,
+        )
+        formatter = matplotlib_axis.get_major_formatter()
+        formatter.set_locs(locations)
+        labels = [
+            formatter(float(location), index)
+            for index, location in enumerate(locations)
+        ]
+        return locations, labels, formatter.get_offset()
+
+    def _draw_interaction_grid(
+        self,
+        painter,
+        data_rect,
+        x_ticks,
+        y_ticks,
+    ):
+        view_min_x, view_max_x = self.axis.get_xlim()
+        view_min_y, view_max_y = self.axis.get_ylim()
+        grid_color = self._qt_gui.QColor("#ffffff")
+        grid_color.setAlphaF(0.35)
+        grid_pen = self._qt_gui.QPen(grid_color)
+        grid_pen.setWidthF(0.45)
+        pen_styles = getattr(
+            self._qt_core.Qt,
+            "PenStyle",
+            self._qt_core.Qt,
+        )
+        grid_pen.setStyle(getattr(pen_styles, "DashLine"))
+        painter.save()
+        painter.setClipRect(data_rect)
+        painter.setPen(grid_pen)
+        for value in x_ticks:
+            if view_min_x <= value <= view_max_x:
+                pixel_x = data_rect.left() + (
+                    (value - view_min_x)
+                    / (view_max_x - view_min_x)
+                    * data_rect.width()
+                )
+                painter.drawLine(
+                    self._qt_core.QPointF(pixel_x, data_rect.top()),
+                    self._qt_core.QPointF(pixel_x, data_rect.bottom()),
+                )
+        for value in y_ticks:
+            if view_min_y <= value <= view_max_y:
+                pixel_y = data_rect.bottom() - (
+                    (value - view_min_y)
+                    / (view_max_y - view_min_y)
+                    * data_rect.height()
+                )
+                painter.drawLine(
+                    self._qt_core.QPointF(data_rect.left(), pixel_y),
+                    self._qt_core.QPointF(data_rect.right(), pixel_y),
+                )
+        painter.restore()
+
+    def _build_trajectory_qpath(self):
+        if self.trajectory_positions is None:
+            return None
+
+        path = self._qt_gui.QPainterPath()
+        path_started = False
+        for x_value, y_value in self.trajectory_positions[:, :2]:
+            if not math.isfinite(x_value) or not math.isfinite(y_value):
+                path_started = False
+                continue
+            if path_started:
+                path.lineTo(float(x_value), float(y_value))
+            else:
+                path.moveTo(float(x_value), float(y_value))
+                path_started = True
+        return path
+
+    def _draw_interaction_trajectory(self, painter, data_rect):
+        if self._trajectory_qpath is None:
+            return
+
+        view_min_x, view_max_x = self.axis.get_xlim()
+        view_min_y, view_max_y = self.axis.get_ylim()
+        scale_x = data_rect.width() / (view_max_x - view_min_x)
+        scale_y = data_rect.height() / (view_max_y - view_min_y)
+        transform = self._qt_gui.QTransform(
+            scale_x,
+            0.0,
+            0.0,
+            -scale_y,
+            data_rect.left() - scale_x * view_min_x,
+            data_rect.top() + scale_y * view_max_y,
+        )
+        trajectory_pen = self._qt_gui.QPen(
+            self._qt_gui.QColor("#FBBC05")
+        )
+        trajectory_pen.setWidthF(1.5)
+        trajectory_pen.setCosmetic(True)
+        painter.save()
+        painter.setClipRect(data_rect)
+        painter.setPen(trajectory_pen)
+        painter.setTransform(transform, True)
+        painter.drawPath(self._trajectory_qpath)
+        painter.restore()
+
+    def _draw_interaction_axes(
+        self,
+        painter,
+        data_rect,
+        x_ticks,
+        x_labels,
+        x_offset,
+        y_ticks,
+        y_labels,
+        y_offset,
+    ):
+        painter.setRenderHint(
+            getattr(
+                getattr(
+                    self._qt_gui.QPainter,
+                    "RenderHint",
+                    self._qt_gui.QPainter,
+                ),
+                "TextAntialiasing",
+            ),
+            True,
+        )
+        border_pen = self._qt_gui.QPen(
+            self._qt_gui.QColor(self.UI_BORDER)
+        )
+        border_pen.setWidthF(0.8)
+        painter.setPen(border_pen)
+        brush_styles = getattr(
+            self._qt_core.Qt,
+            "BrushStyle",
+            self._qt_core.Qt,
+        )
+        painter.setBrush(getattr(brush_styles, "NoBrush"))
+        painter.drawRect(data_rect)
+
+        tick_font = self._qt_gui.QFont()
+        tick_font.setPointSizeF(9.0)
+        painter.setFont(tick_font)
+        painter.setPen(self._qt_gui.QColor(self.UI_MUTED_TEXT))
+        tick_metrics = self._qt_gui.QFontMetricsF(tick_font)
+        tick_length = 4.0
+        view_min_x, view_max_x = self.axis.get_xlim()
+        view_min_y, view_max_y = self.axis.get_ylim()
+
+        for value, label in zip(x_ticks, x_labels):
+            if not view_min_x <= value <= view_max_x:
+                continue
+            pixel_x = data_rect.left() + (
+                (value - view_min_x)
+                / (view_max_x - view_min_x)
+                * data_rect.width()
+            )
+            painter.drawLine(
+                self._qt_core.QPointF(pixel_x, data_rect.bottom()),
+                self._qt_core.QPointF(
+                    pixel_x,
+                    data_rect.bottom() + tick_length,
+                ),
+            )
+            label_width = max(tick_metrics.horizontalAdvance(label) + 8.0, 48.0)
+            painter.drawText(
+                self._qt_core.QRectF(
+                    pixel_x - label_width / 2.0,
+                    data_rect.bottom() + tick_length + 2.0,
+                    label_width,
+                    tick_metrics.height() + 3.0,
+                ),
+                self._qt_align_center,
+                label,
+            )
+
+        y_label_right = data_rect.left() - tick_length - 4.0
+        y_label_width = max(data_rect.left() - 22.0, 20.0)
+        for value, label in zip(y_ticks, y_labels):
+            if not view_min_y <= value <= view_max_y:
+                continue
+            pixel_y = data_rect.bottom() - (
+                (value - view_min_y)
+                / (view_max_y - view_min_y)
+                * data_rect.height()
+            )
+            painter.drawLine(
+                self._qt_core.QPointF(data_rect.left(), pixel_y),
+                self._qt_core.QPointF(
+                    data_rect.left() - tick_length,
+                    pixel_y,
+                ),
+            )
+            painter.drawText(
+                self._qt_core.QRectF(
+                    y_label_right - y_label_width,
+                    pixel_y - tick_metrics.height() / 2.0,
+                    y_label_width,
+                    tick_metrics.height(),
+                ),
+                self._qt_align_right_center,
+                label,
+            )
+
+        offset_font = self._qt_gui.QFont(tick_font)
+        offset_font.setPointSizeF(8.5)
+        painter.setFont(offset_font)
+        if x_offset:
+            painter.drawText(
+                self._qt_core.QRectF(
+                    data_rect.right() - 100.0,
+                    data_rect.bottom() + tick_metrics.height() + 7.0,
+                    100.0,
+                    tick_metrics.height(),
+                ),
+                self._qt_align_right_center,
+                x_offset,
+            )
+        if y_offset:
+            painter.drawText(
+                self._qt_core.QRectF(
+                    data_rect.left(),
+                    data_rect.top() - tick_metrics.height() - 2.0,
+                    100.0,
+                    tick_metrics.height(),
+                ),
+                self._qt_align_right_center,
+                y_offset,
+            )
+
+        label_font = self._qt_gui.QFont()
+        label_font.setPointSizeF(10.0)
+        painter.setFont(label_font)
+        painter.setPen(self._qt_gui.QColor("#475569"))
+        painter.drawText(
+            self._qt_core.QRectF(
+                data_rect.left(),
+                data_rect.bottom() + tick_metrics.height() + 10.0,
+                data_rect.width(),
+                24.0,
+            ),
+            self._qt_align_center,
+            "X (m)",
+        )
+        painter.save()
+        painter.translate(
+            max(10.0, data_rect.left() - 42.0),
+            data_rect.center().y(),
+        )
+        painter.rotate(-90.0)
+        painter.drawText(
+            self._qt_core.QRectF(
+                -data_rect.height() / 2.0,
+                -12.0,
+                data_rect.height(),
+                24.0,
+            ),
+            self._qt_align_center,
+            "Y (m)",
+        )
+        painter.restore()
+
+        title_font = self._qt_gui.QFont()
+        title_font.setPointSizeF(14.0)
+        title_font.setBold(False)
+        painter.setFont(title_font)
+        painter.setPen(self._qt_gui.QColor(self.UI_TEXT))
+        title_gap = (
+            self.TITLE_PAD_POINTS
+            * float(self._interaction_overlay.logicalDpiY())
+            / 72.0
+        )
+        painter.drawText(
+            self._qt_core.QRectF(
+                data_rect.left(),
+                0.0,
+                data_rect.width(),
+                max(1.0, data_rect.top() - title_gap),
+            ),
+            self._qt_align_bottom_center,
+            self.title,
+        )
+
+    def _begin_interaction(self):
+        if self._interaction_active:
+            return
+        self._interaction_restore_timer.stop()
+        self._bev_qpixmap(self.bev)
+        self._interaction_active = True
+        self._interaction_overlay.update()
+
+    def _show_persistent_overlay(self):
+        self._bev_qpixmap(self.bev)
+        self._update_interaction_overlay_geometry()
+        self._interaction_overlay.show()
+        self._interaction_overlay.raise_()
+        self._interaction_overlay.update()
+
+    def _update_interaction_overlay(self):
+        if not self._interaction_active:
+            self._begin_interaction()
+        self._interaction_overlay.update()
+
+    def _schedule_interaction_finish(self):
+        self._interaction_restore_timer.stop()
+        self._interaction_restore_timer.start()
+
+    def _finish_interaction(self, draw=True, force=False):
+        if not self._interaction_active:
+            return False
+        if (
+            not force
+            and hasattr(self, "_qt_zoom_slider")
+            and self._qt_zoom_slider.isSliderDown()
+        ):
+            return False
+
+        self._interaction_restore_timer.stop()
+        if draw:
+            # Synchronize Matplotlib behind the persistent Qt plot layer.
+            # The screen never switches renderers when interaction ends.
+            self.figure.canvas.draw()
+        self._interaction_active = False
+        self._interaction_overlay.raise_()
+        self._interaction_overlay.update()
+        return True
+
+    def _cancel_interaction(self):
+        if hasattr(self, "_interaction_restore_timer"):
+            self._interaction_restore_timer.stop()
+        self._interaction_active = False
+        if hasattr(self, "_interaction_overlay"):
+            self._interaction_overlay.raise_()
+            self._interaction_overlay.update()
+
     def _select_bev_resolution(self, width, height):
         self.selected_bev_width = width
         self.selected_bev_height = height
@@ -870,7 +1443,7 @@ class PcdMonitor:
         )
 
     def _zoom_slider_released(self):
-        self._schedule_full_resolution_restore()
+        self._finish_interaction(force=True)
 
     def _view_width_to_slider_value(self, view_width):
         bounded_width = min(
@@ -904,7 +1477,7 @@ class PcdMonitor:
         new_width = self._slider_value_to_view_width(slider_value)
         new_height = new_width / self.BEV_ASPECT_RATIO
 
-        self._show_interaction_preview()
+        self._begin_interaction()
         self._set_axis_limits(
             (
                 center_x - new_width / 2.0,
@@ -916,8 +1489,8 @@ class PcdMonitor:
             ),
         )
         self._set_zoom_slider_value_text(new_width)
-        self.figure.canvas.draw_idle()
-        self._schedule_full_resolution_restore()
+        self._update_interaction_overlay()
+        self._schedule_interaction_finish()
 
     def _sync_zoom_slider_to_current_view(self):
         if not hasattr(self, "_qt_zoom_slider"):
@@ -943,37 +1516,6 @@ class PcdMonitor:
             "{:.2f}×".format(zoom_factor)
         )
 
-    def _show_interaction_preview(self):
-        if (
-            self._using_interaction_preview
-            or self._interaction_preview_grid is self._full_image_grid
-        ):
-            return
-        self.image.set_data(self._interaction_preview_grid)
-        self._using_interaction_preview = True
-
-    def _show_full_resolution(self):
-        if not self._using_interaction_preview:
-            return
-        self.image.set_data(self._full_image_grid)
-        self._using_interaction_preview = False
-
-    def _schedule_full_resolution_restore(self):
-        self._interaction_restore_timer.stop()
-        self._interaction_restore_timer.start()
-
-    def _restore_full_resolution_after_interaction(self):
-        if (
-            self._drag_state is not None
-            or (
-                hasattr(self, "_qt_zoom_slider")
-                and self._qt_zoom_slider.isSliderDown()
-            )
-        ):
-            return
-        self._show_full_resolution()
-        self.figure.canvas.draw_idle()
-
     def _on_key_press(self, event):
         if event.key and event.key.lower() == "r":
             self._restore_full_bev()
@@ -982,6 +1524,7 @@ class PcdMonitor:
         self._restore_full_bev()
 
     def _save_clicked(self, _event):
+        self._finish_interaction(force=True)
         self._save_action.setText("Saving…")
         self._save_action.setEnabled(False)
         self.figure.canvas.flush_events()
@@ -1046,14 +1589,12 @@ class PcdMonitor:
 
         colormap = copy.copy(plt.get_cmap(self.colormap))
         colormap.set_bad(color="#f3f4f6", alpha=1.0)
-        export_image = export_axis.imshow(
-            self._full_image_grid,
-            origin="lower",
+        export_axis.imshow(
+            self.bev["rgba_image"],
+            origin="upper",
             extent=self.bev["extent"],
             interpolation="nearest",
             resample=False,
-            cmap=colormap,
-            norm=self._normalization_for_bev(self.bev),
             aspect="equal",
         )
         self._draw_trajectory(export_axis)
@@ -1067,8 +1608,13 @@ class PcdMonitor:
             bbox_transform=export_axis.transAxes,
             borderpad=0.0,
         )
+        export_mappable = ScalarMappable(
+            norm=self._normalization_for_bev(self.bev),
+            cmap=colormap,
+        )
+        export_mappable.set_array([])
         export_colorbar = export_figure.colorbar(
-            export_image,
+            export_mappable,
             cax=export_colorbar_axis,
         )
         export_colorbar.set_label("Maximum Z in pixel (m), fixed P1-P99")
@@ -1102,6 +1648,7 @@ class PcdMonitor:
         return line
 
     def _rebuild_clicked(self, _event):
+        self._finish_interaction(force=True)
         x_limits = self.axis.get_xlim()
         y_limits = self.axis.get_ylim()
         extent = extent_for_bounds(
@@ -1122,6 +1669,7 @@ class PcdMonitor:
                 grid_height=self.selected_bev_height,
                 dataset_stats=self.dataset_stats,
             )
+            self._build_bev_image(bev)
         except PcdError as error:
             rospy.logerr("Could not rebuild PCD BEV: %s", error)
         else:
@@ -1133,22 +1681,25 @@ class PcdMonitor:
             self.figure.canvas.draw_idle()
 
     def _restore_full_bev(self):
+        self._cancel_interaction()
         self._apply_bev(self.full_bev)
         self._log_bev_info("Restored full BEV", self.full_bev)
         self.figure.canvas.draw_idle()
 
     def _apply_bev(self, bev):
-        self._interaction_restore_timer.stop()
+        self._cancel_interaction()
         self._drag_state = None
+        self._build_bev_image(bev)
         self.bev = bev
-        self._prepare_image_grids(bev)
-        self.image.set_data(self._full_image_grid)
-        self._using_interaction_preview = False
+        self._bev_qpixmap(bev)
+        self.image.set_data(bev["rgba_image"])
         self.image.set_extent(bev["extent"])
-        self.image.set_norm(self._normalization_for_bev(bev))
-        self.colorbar.update_normal(self.image)
+        self.color_mappable.set_norm(self._normalization_for_bev(bev))
+        self.colorbar.update_normal(self.color_mappable)
         self._set_plot_title()
         self._set_axis_extent(bev["extent"])
+        self._interaction_overlay.raise_()
+        self._interaction_overlay.update()
 
     def _log_bev_info(self, label, bev):
         min_x, max_x, min_y, max_y = bev["extent"]
@@ -1190,47 +1741,20 @@ class PcdMonitor:
             value_max += padding
         return Normalize(vmin=value_min, vmax=value_max, clip=True)
 
-    def _prepare_image_grids(self, bev):
-        self._full_image_grid = bev["grid"]
-        if "_interaction_preview_grid" in bev:
-            self._interaction_preview_grid = bev["_interaction_preview_grid"]
+    def _build_bev_image(self, bev):
+        if "rgba_image" in bev:
             return
 
-        grid = self._full_image_grid
-        grid_height, grid_width = grid.shape
-        preview_scale = max(
-            1,
-            (grid_width + self.INTERACTION_PREVIEW_WIDTH - 1)
-            // self.INTERACTION_PREVIEW_WIDTH,
-            (grid_height + self.INTERACTION_PREVIEW_HEIGHT - 1)
-            // self.INTERACTION_PREVIEW_HEIGHT,
+        colormap = copy.copy(plt.get_cmap(self.colormap))
+        colormap.set_bad(color="#f3f4f6", alpha=1.0)
+        masked_grid = np.ma.masked_invalid(bev["grid"])
+        rgba_bottom_up = colormap(
+            self._normalization_for_bev(bev)(masked_grid),
+            bytes=True,
         )
-        if preview_scale == 1:
-            self._interaction_preview_grid = self._full_image_grid
-            bev["_interaction_preview_grid"] = self._interaction_preview_grid
-            return
-
-        preview_height = (grid_height + preview_scale - 1) // preview_scale
-        preview_width = (grid_width + preview_scale - 1) // preview_scale
-        preview_grid = np.full(
-            (preview_height, preview_width),
-            -np.inf,
-            dtype=grid.dtype,
-        )
-
-        # Max-pooling preserves the highest Z point in every preview pixel.
-        # Sliced reductions avoid allocating a full-size temporary array.
-        for row_offset in range(preview_scale):
-            for column_offset in range(preview_scale):
-                source = grid[
-                    row_offset::preview_scale,
-                    column_offset::preview_scale,
-                ]
-                destination = preview_grid[: source.shape[0], : source.shape[1]]
-                np.maximum(destination, source, out=destination)
-
-        self._interaction_preview_grid = preview_grid
-        bev["_interaction_preview_grid"] = self._interaction_preview_grid
+        # Store rows in display order (top to bottom). Matplotlib uses
+        # origin="upper" and Qt can consume the same contiguous RGBA buffer.
+        bev["rgba_image"] = np.ascontiguousarray(rgba_bottom_up[::-1])
 
     def _set_axis_extent(self, extent):
         min_x, max_x, min_y, max_y = extent
