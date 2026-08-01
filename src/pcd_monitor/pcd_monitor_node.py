@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
+from matplotlib.patches import FancyBboxPatch
 from matplotlib.widgets import Button, Slider
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
@@ -243,97 +244,104 @@ class PcdMonitor:
         ]
 
         rebuild_axis = self.figure.add_axes(
-            [button_x_positions[0], button_y, button_width, button_height]
+            [button_x_positions[3], button_y, button_width, button_height]
         )
         self.rebuild_button = Button(
             rebuild_axis,
             "Rebuild BEV",
-            color="#f59e0b",
-            hovercolor="#d97706",
-        )
-        self._style_button(
-            rebuild_axis,
-            self.rebuild_button,
-            "#f59e0b",
-            "#b45309",
-        )
-        self.rebuild_button.on_clicked(self._rebuild_clicked)
-
-        reset_axis = self.figure.add_axes(
-            [button_x_positions[1], button_y, button_width, button_height]
-        )
-        self.reset_button = Button(
-            reset_axis,
-            "Reset view",
             color="#2563eb",
             hovercolor="#1d4ed8",
         )
         self._style_button(
-            reset_axis,
-            self.reset_button,
+            rebuild_axis,
+            self.rebuild_button,
             "#2563eb",
             "#1e40af",
+        )
+        self.rebuild_button.on_clicked(self._rebuild_clicked)
+
+        reset_axis = self.figure.add_axes(
+            [button_x_positions[0], button_y, button_width, button_height]
+        )
+        self.reset_button = Button(
+            reset_axis,
+            "Reset view",
+            color="#f59e0b",
+            hovercolor="#d97706",
+        )
+        self._style_button(
+            reset_axis,
+            self.reset_button,
+            "#f59e0b",
+            "#b45309",
         )
         self.reset_button.on_clicked(self._reset_clicked)
 
         save_axis = self.figure.add_axes(
-            [button_x_positions[2], button_y, button_width, button_height]
+            [button_x_positions[4], button_y, button_width, button_height]
         )
         self.save_button = Button(
             save_axis,
             "Save Image",
-            color="#059669",
-            hovercolor="#047857",
-        )
-        self._style_button(
-            save_axis,
-            self.save_button,
-            "#059669",
-            "#065f46",
-        )
-        self.save_button.on_clicked(self._save_clicked)
-
-        resolution_axis = self.figure.add_axes(
-            [button_x_positions[3], button_y, button_width, button_height]
-        )
-        self.resolution_button = Button(
-            resolution_axis,
-            self._resolution_button_label(),
             color="#7c3aed",
             hovercolor="#6d28d9",
         )
         self._style_button(
-            resolution_axis,
-            self.resolution_button,
+            save_axis,
+            self.save_button,
             "#7c3aed",
             "#5b21b6",
+        )
+        self.save_button.on_clicked(self._save_clicked)
+
+        resolution_axis = self.figure.add_axes(
+            [button_x_positions[2], button_y, button_width, button_height]
+        )
+        self.resolution_button = Button(
+            resolution_axis,
+            self._resolution_button_label(),
+            color="#0891b2",
+            hovercolor="#0e7490",
+        )
+        self._style_button(
+            resolution_axis,
+            self.resolution_button,
+            "#0891b2",
+            "#155e75",
         )
         self.resolution_button.on_clicked(self._toggle_resolution_popup)
         self._create_resolution_popup()
 
         zoom_axis = self.figure.add_axes(
-            [button_x_positions[4], button_y, button_width, button_height]
+            [button_x_positions[1], button_y, button_width, button_height]
         )
         self.zoom_button = Button(
             zoom_axis,
             "Zoom",
-            color="#0891b2",
-            hovercolor="#0e7490",
+            color="#059669",
+            hovercolor="#047857",
         )
         self._style_button(
             zoom_axis,
             self.zoom_button,
-            "#0891b2",
-            "#155e75",
+            "#059669",
+            "#065f46",
         )
         self.zoom_button.on_clicked(self._toggle_zoom_slider)
         self._create_zoom_slider()
         self._control_button_axes = (
-            rebuild_axis,
             reset_axis,
-            save_axis,
-            resolution_axis,
             zoom_axis,
+            resolution_axis,
+            rebuild_axis,
+            save_axis,
+        )
+        self._control_buttons = (
+            self.reset_button,
+            self.zoom_button,
+            self.resolution_button,
+            self.rebuild_button,
+            self.save_button,
         )
         self._layout_controls()
 
@@ -635,6 +643,7 @@ class PcdMonitor:
             self._set_resolution_popup_visible(False)
 
     def _layout_controls(self):
+        figure_width = max(float(self.figure.bbox.width), 1.0)
         figure_height = max(float(self.figure.bbox.height), 1.0)
         button_y = 0.035
         button_height = max(0.06, 30.0 / figure_height)
@@ -654,20 +663,60 @@ class PcdMonitor:
         )
 
         resolution_position = self.resolution_button.ax.get_position()
-        option_height = max(0.042, 24.0 / figure_height)
-        option_gap = 3.0 / figure_height
+        option_height_pixels = min(
+            48.0,
+            max(34.0, 0.042 * figure_height),
+        )
+        option_height = option_height_pixels / figure_height
+        popup_width = max(
+            200.0 / figure_width,
+            min(resolution_position.width, 280.0 / figure_width),
+        )
+        popup_padding_x = 6.0 / figure_width
+        popup_padding_y = 6.0 / figure_height
+        option_width = popup_width - 2.0 * popup_padding_x
+        popup_height = (
+            len(self._resolution_option_axes) * option_height
+            + 2.0 * popup_padding_y
+        )
+        popup_x = min(
+            1.0 - popup_width - 4.0 / figure_width,
+            max(
+                4.0 / figure_width,
+                resolution_position.x0
+                + 0.5 * (resolution_position.width - popup_width),
+            ),
+        )
         popup_y = resolution_position.y1 + slider_gap
         for option_index, option_axis in enumerate(
             self._resolution_option_axes
         ):
             option_axis.set_position(
                 [
-                    resolution_position.x0,
-                    popup_y + option_index * (option_height + option_gap),
-                    resolution_position.width,
+                    popup_x + popup_padding_x,
+                    popup_y
+                    + popup_padding_y
+                    + (
+                        len(self._resolution_option_axes)
+                        - option_index
+                        - 1
+                    ) * option_height,
+                    option_width,
                     option_height,
                 ]
             )
+        self._resolution_popup_panel.set_bounds(
+            popup_x,
+            popup_y,
+            popup_width,
+            popup_height,
+        )
+        self._resolution_popup_shadow.set_bounds(
+            popup_x + 2.0 / figure_width,
+            popup_y - 2.0 / figure_height,
+            popup_width,
+            popup_height,
+        )
 
         plot_top = min(0.93, 1.0 - 35.0 / figure_height)
         self.figure.subplots_adjust(
@@ -685,54 +734,137 @@ class PcdMonitor:
                 plot_position.height,
             )
         )
+        self._apply_adaptive_button_fonts()
+
+    def _apply_adaptive_button_fonts(self):
+        figure_height = max(float(self.figure.bbox.height), 1.0)
+        default_figure_height = (
+            self.INITIAL_FIGURE_SIZE[1] * self.FIGURE_DPI
+        )
+
+        button_height_pixels = max(0.06 * figure_height, 30.0)
+        default_button_height_pixels = 0.06 * default_figure_height
+        button_font_size = min(
+            13.0,
+            max(
+                8.0,
+                10.0 * button_height_pixels / default_button_height_pixels,
+            ),
+        )
+        for button in self._control_buttons:
+            button.label.set_fontsize(button_font_size)
+
+        option_height_pixels = max(0.042 * figure_height, 24.0)
+        default_option_height_pixels = 0.042 * default_figure_height
+        option_font_size = min(
+            13.0,
+            max(
+                8.0,
+                10.0 * option_height_pixels / default_option_height_pixels,
+            ),
+        )
+        for (
+            option_button,
+            _width,
+            _height,
+            selection_indicator,
+        ) in self._resolution_option_buttons:
+            option_button.label.set_fontsize(option_font_size)
+            selection_indicator.set_fontsize(option_font_size + 1.0)
 
     def _resolution_button_label(self):
-        return "Resolution\n{}*{}".format(
-            self.selected_bev_width,
-            self.selected_bev_height,
+        return "Resolution"
+
+    def _style_resolution_option(
+        self,
+        option_button,
+        selection_indicator,
+        is_selected,
+    ):
+        if is_selected:
+            facecolor = "#ecfeff"
+            hovercolor = "#cffafe"
+            text_color = "#0e7490"
+        else:
+            facecolor = "#ffffff"
+            hovercolor = "#f1f5f9"
+            text_color = "#334155"
+
+        option_button.color = facecolor
+        option_button.hovercolor = hovercolor
+        option_button.ax.set_facecolor(facecolor)
+        for spine in option_button.ax.spines.values():
+            spine.set_visible(False)
+        option_button.label.set_color(text_color)
+        option_button.label.set_fontweight(
+            "bold" if is_selected else "normal"
         )
+        option_button.label.set_horizontalalignment("left")
+        option_button.label.set_position((0.08, 0.5))
+        selection_indicator.set_visible(is_selected)
 
     def _create_resolution_popup(self):
         self._resolution_popup_visible = False
         self._resolution_option_axes = []
         self._resolution_option_buttons = []
 
-        option_height = 0.042
-        option_gap = 0.004
-        resolution_position = self.resolution_button.ax.get_position()
-        popup_x = resolution_position.x0
-        popup_y = resolution_position.y1 + 0.01
-        popup_width = resolution_position.width
-        for option_index, (width, height) in enumerate(
-            reversed(self.BEV_RESOLUTIONS)
-        ):
+        self._resolution_popup_shadow = FancyBboxPatch(
+            (0.0, 0.0),
+            0.0,
+            0.0,
+            boxstyle="round,pad=0.004,rounding_size=0.008",
+            transform=self.figure.transFigure,
+            facecolor="#0f172a",
+            edgecolor="none",
+            alpha=0.14,
+            zorder=18,
+            visible=False,
+        )
+        self.figure.add_artist(self._resolution_popup_shadow)
+        self._resolution_popup_panel = FancyBboxPatch(
+            (0.0, 0.0),
+            0.0,
+            0.0,
+            boxstyle="round,pad=0.004,rounding_size=0.008",
+            transform=self.figure.transFigure,
+            facecolor="#ffffff",
+            edgecolor="#cbd5e1",
+            linewidth=0.8,
+            zorder=19,
+            visible=False,
+        )
+        self.figure.add_artist(self._resolution_popup_panel)
+
+        for width, height in self.BEV_RESOLUTIONS:
             option_axis = self.figure.add_axes(
-                [
-                    popup_x,
-                    popup_y + option_index * (option_height + option_gap),
-                    popup_width,
-                    option_height,
-                ]
+                [0.0, 0.0, 0.1, 0.042]
             )
             option_axis.set_zorder(20)
             is_selected = (
                 width == self.selected_bev_width
                 and height == self.selected_bev_height
             )
-            facecolor = "#0f766e" if is_selected else "#4b5563"
-            hovercolor = "#0d9488" if is_selected else "#374151"
-            spine_color = "#115e59" if is_selected else "#1f2937"
             option_button = Button(
                 option_axis,
-                "{}*{}".format(width, height),
-                color=facecolor,
-                hovercolor=hovercolor,
+                "{} × {}".format(width, height),
+                color="#ffffff",
+                hovercolor="#f1f5f9",
             )
-            self._style_button(
-                option_axis,
+            selection_indicator = option_axis.text(
+                0.90,
+                0.5,
+                "✓",
+                transform=option_axis.transAxes,
+                color="#0891b2",
+                fontsize=11,
+                fontweight="bold",
+                horizontalalignment="center",
+                verticalalignment="center",
+            )
+            self._style_resolution_option(
                 option_button,
-                facecolor,
-                spine_color,
+                selection_indicator,
+                is_selected,
             )
             option_button.on_clicked(
                 lambda _event, selected_width=width, selected_height=height:
@@ -741,7 +873,12 @@ class PcdMonitor:
             option_axis.set_visible(False)
             self._resolution_option_axes.append(option_axis)
             self._resolution_option_buttons.append(
-                (option_button, width, height)
+                (
+                    option_button,
+                    width,
+                    height,
+                    selection_indicator,
+                )
             )
 
     def _toggle_resolution_popup(self, _event):
@@ -752,6 +889,12 @@ class PcdMonitor:
 
     def _set_resolution_popup_visible(self, visible):
         self._resolution_popup_visible = bool(visible)
+        self._resolution_popup_shadow.set_visible(
+            self._resolution_popup_visible
+        )
+        self._resolution_popup_panel.set_visible(
+            self._resolution_popup_visible
+        )
         for option_axis in self._resolution_option_axes:
             option_axis.set_visible(self._resolution_popup_visible)
         self.figure.canvas.draw_idle()
@@ -759,9 +902,6 @@ class PcdMonitor:
     def _select_bev_resolution(self, width, height):
         self.selected_bev_width = width
         self.selected_bev_height = height
-        self.resolution_button.label.set_text(
-            self._resolution_button_label()
-        )
         self._update_resolution_option_styles()
         self._set_resolution_popup_visible(False)
         rospy.loginfo(
@@ -772,22 +912,22 @@ class PcdMonitor:
         )
 
     def _update_resolution_option_styles(self):
-        for option_button, width, height in self._resolution_option_buttons:
+        for (
+            option_button,
+            width,
+            height,
+            selection_indicator,
+        ) in self._resolution_option_buttons:
             is_selected = (
                 width == self.selected_bev_width
                 and height == self.selected_bev_height
             )
-            facecolor = "#0f766e" if is_selected else "#4b5563"
-            hovercolor = "#0d9488" if is_selected else "#374151"
-            spine_color = "#115e59" if is_selected else "#1f2937"
-            option_button.color = facecolor
-            option_button.hovercolor = hovercolor
-            self._style_button(
-                option_button.ax,
+            self._style_resolution_option(
                 option_button,
-                facecolor,
-                spine_color,
+                selection_indicator,
+                is_selected,
             )
+        self._apply_adaptive_button_fonts()
 
     def _create_zoom_slider(self):
         self._zoom_slider_visible = False
@@ -803,12 +943,12 @@ class PcdMonitor:
             1.0,
             valinit=self._view_width_to_slider_value(self.full_view_width),
             valfmt="%1.2f",
-            color="#0891b2",
+            color="#059669",
             track_color="#d1d5db",
             initcolor="none",
             handle_style={
-                "facecolor": "#0891b2",
-                "edgecolor": "#155e75",
+                "facecolor": "#059669",
+                "edgecolor": "#065f46",
                 "size": 6,
             },
         )
@@ -828,7 +968,7 @@ class PcdMonitor:
             [0.0, self.zoom_slider.val],
             [0.5, 0.5],
             transform=self.zoom_slider_axis.transAxes,
-            color="#0891b2",
+            color="#059669",
             linewidth=4.0,
             solid_capstyle="round",
             zorder=2,
