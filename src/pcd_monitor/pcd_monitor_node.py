@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
+import math
 import os
 from pathlib import Path
 import sys
@@ -31,7 +32,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, Slider
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
 import rospy
@@ -138,6 +139,7 @@ class PcdMonitor:
             aspect_ratio=self.BEV_ASPECT_RATIO,
         )
         full_view_width = self.full_extent[1] - self.full_extent[0]
+        self.full_view_width = full_view_width
         self.min_view_width = min(
             full_view_width,
             self.voxel_size * self.MIN_VIEW_VOXELS,
@@ -225,7 +227,24 @@ class PcdMonitor:
         self.axis.grid(True, color="#ffffff", linestyle="--", linewidth=0.45, alpha=0.35)
         self._set_axis_extent(self.bev["extent"])
 
-        rebuild_axis = self.figure.add_axes([0.09, 0.035, 0.18, 0.06])
+        button_width = 0.16
+        button_gap = 0.015
+        button_height = 0.06
+        button_y = 0.035
+        button_count = 5
+        buttons_width = (
+            button_count * button_width
+            + (button_count - 1) * button_gap
+        )
+        first_button_x = (1.0 - buttons_width) / 2.0
+        button_x_positions = [
+            first_button_x + index * (button_width + button_gap)
+            for index in range(button_count)
+        ]
+
+        rebuild_axis = self.figure.add_axes(
+            [button_x_positions[0], button_y, button_width, button_height]
+        )
         self.rebuild_button = Button(
             rebuild_axis,
             "Rebuild BEV",
@@ -240,7 +259,9 @@ class PcdMonitor:
         )
         self.rebuild_button.on_clicked(self._rebuild_clicked)
 
-        reset_axis = self.figure.add_axes([0.285, 0.035, 0.18, 0.06])
+        reset_axis = self.figure.add_axes(
+            [button_x_positions[1], button_y, button_width, button_height]
+        )
         self.reset_button = Button(
             reset_axis,
             "Reset view",
@@ -255,7 +276,9 @@ class PcdMonitor:
         )
         self.reset_button.on_clicked(self._reset_clicked)
 
-        save_axis = self.figure.add_axes([0.48, 0.035, 0.18, 0.06])
+        save_axis = self.figure.add_axes(
+            [button_x_positions[2], button_y, button_width, button_height]
+        )
         self.save_button = Button(
             save_axis,
             "Save Image",
@@ -270,7 +293,9 @@ class PcdMonitor:
         )
         self.save_button.on_clicked(self._save_clicked)
 
-        resolution_axis = self.figure.add_axes([0.675, 0.035, 0.18, 0.06])
+        resolution_axis = self.figure.add_axes(
+            [button_x_positions[3], button_y, button_width, button_height]
+        )
         self.resolution_button = Button(
             resolution_axis,
             self._resolution_button_label(),
@@ -286,15 +311,31 @@ class PcdMonitor:
         self.resolution_button.on_clicked(self._toggle_resolution_popup)
         self._create_resolution_popup()
 
-        self.help_text = self.figure.text(
-            0.5,
-            0.015,
-            "Wheel: zoom    Left drag: pan    Rebuild: current view",
-            ha="center",
-            va="center",
-            fontsize=8.5,
-            color="#4b5563",
+        zoom_axis = self.figure.add_axes(
+            [button_x_positions[4], button_y, button_width, button_height]
         )
+        self.zoom_button = Button(
+            zoom_axis,
+            "Zoom",
+            color="#0891b2",
+            hovercolor="#0e7490",
+        )
+        self._style_button(
+            zoom_axis,
+            self.zoom_button,
+            "#0891b2",
+            "#155e75",
+        )
+        self.zoom_button.on_clicked(self._toggle_zoom_slider)
+        self._create_zoom_slider()
+        self._control_button_axes = (
+            rebuild_axis,
+            reset_axis,
+            save_axis,
+            resolution_axis,
+            zoom_axis,
+        )
+        self._layout_controls()
 
         canvas = self.figure.canvas
         canvas.mpl_connect("scroll_event", self._on_scroll)
@@ -464,14 +505,17 @@ class PcdMonitor:
             event.ydata - relative_y * new_height,
             event.ydata + (1.0 - relative_y) * new_height,
         )
+        self._sync_zoom_slider_to_current_view()
         self.figure.canvas.draw_idle()
         self._schedule_full_resolution_restore()
 
     def _on_resize(self, _event):
+        self._layout_controls()
         self._show_interaction_preview()
         self._schedule_full_resolution_restore()
 
     def _on_button_press(self, event):
+        self._dismiss_transient_controls_for_event(event)
         if event.inaxes is not self.axis:
             return
         if event.dblclick and event.button == 1:
@@ -517,6 +561,11 @@ class PcdMonitor:
 
     def _on_button_release(self, event):
         if self._drag_state is None:
+            if (
+                hasattr(self, "zoom_slider_axis")
+                and event.inaxes is self.zoom_slider_axis
+            ):
+                self._schedule_full_resolution_restore()
             return
 
         if event.x is not None and event.y is not None:
@@ -567,6 +616,76 @@ class PcdMonitor:
         button.label.set_fontsize(10)
         button.label.set_fontweight("bold")
 
+    def _dismiss_transient_controls_for_event(self, event):
+        if (
+            self._zoom_slider_visible
+            and event.inaxes not in (
+                self.zoom_slider_axis,
+                self.zoom_button.ax,
+            )
+        ):
+            self._set_zoom_slider_visible(False)
+
+        resolution_axes = [self.resolution_button.ax]
+        resolution_axes.extend(self._resolution_option_axes)
+        if (
+            self._resolution_popup_visible
+            and event.inaxes not in resolution_axes
+        ):
+            self._set_resolution_popup_visible(False)
+
+    def _layout_controls(self):
+        figure_height = max(float(self.figure.bbox.height), 1.0)
+        button_y = 0.035
+        button_height = max(0.06, 30.0 / figure_height)
+        slider_gap = 8.0 / figure_height
+        slider_height = 16.0 / figure_height
+
+        for button_axis in self._control_button_axes:
+            position = button_axis.get_position()
+            button_axis.set_position(
+                [position.x0, button_y, position.width, button_height]
+            )
+
+        button_top = button_y + button_height
+        slider_y = button_top + slider_gap
+        self.zoom_slider_axis.set_position(
+            [0.18, slider_y, 0.64, slider_height]
+        )
+
+        resolution_position = self.resolution_button.ax.get_position()
+        option_height = max(0.042, 24.0 / figure_height)
+        option_gap = 3.0 / figure_height
+        popup_y = resolution_position.y1 + slider_gap
+        for option_index, option_axis in enumerate(
+            self._resolution_option_axes
+        ):
+            option_axis.set_position(
+                [
+                    resolution_position.x0,
+                    popup_y + option_index * (option_height + option_gap),
+                    resolution_position.width,
+                    option_height,
+                ]
+            )
+
+        plot_top = min(0.93, 1.0 - 35.0 / figure_height)
+        self.figure.subplots_adjust(
+            left=0.09,
+            bottom=0.17,
+            right=0.88,
+            top=plot_top,
+        )
+        plot_position = self.axis.get_position()
+        self.axis.set_position(
+            (
+                (1.0 - plot_position.width) / 2.0,
+                plot_position.y0,
+                plot_position.width,
+                plot_position.height,
+            )
+        )
+
     def _resolution_button_label(self):
         return "Resolution\n{}*{}".format(
             self.selected_bev_width,
@@ -580,8 +699,10 @@ class PcdMonitor:
 
         option_height = 0.042
         option_gap = 0.004
-        popup_x = 0.675
-        popup_y = 0.105
+        resolution_position = self.resolution_button.ax.get_position()
+        popup_x = resolution_position.x0
+        popup_y = resolution_position.y1 + 0.01
+        popup_width = resolution_position.width
         for option_index, (width, height) in enumerate(
             reversed(self.BEV_RESOLUTIONS)
         ):
@@ -589,7 +710,7 @@ class PcdMonitor:
                 [
                     popup_x,
                     popup_y + option_index * (option_height + option_gap),
-                    0.18,
+                    popup_width,
                     option_height,
                 ]
             )
@@ -624,9 +745,10 @@ class PcdMonitor:
             )
 
     def _toggle_resolution_popup(self, _event):
-        self._set_resolution_popup_visible(
-            not self._resolution_popup_visible
-        )
+        visible = not self._resolution_popup_visible
+        if visible:
+            self._set_zoom_slider_visible(False)
+        self._set_resolution_popup_visible(visible)
 
     def _set_resolution_popup_visible(self, visible):
         self._resolution_popup_visible = bool(visible)
@@ -667,6 +789,142 @@ class PcdMonitor:
                 spine_color,
             )
 
+    def _create_zoom_slider(self):
+        self._zoom_slider_visible = False
+        self._updating_zoom_slider = False
+        self.zoom_slider_axis = self.figure.add_axes(
+            [0.18, 0.085, 0.64, 0.022]
+        )
+        self.zoom_slider_axis.set_zorder(20)
+        self.zoom_slider = Slider(
+            self.zoom_slider_axis,
+            "Zoom",
+            0.0,
+            1.0,
+            valinit=self._view_width_to_slider_value(self.full_view_width),
+            valfmt="%1.2f",
+            color="#0891b2",
+            track_color="#d1d5db",
+            initcolor="none",
+            handle_style={
+                "facecolor": "#0891b2",
+                "edgecolor": "#155e75",
+                "size": 6,
+            },
+        )
+        self.zoom_slider.track.set_visible(False)
+        self.zoom_slider.poly.set_visible(False)
+        self.zoom_slider.vline.set_visible(False)
+        (self._zoom_slider_track_line,) = self.zoom_slider_axis.plot(
+            [0.0, 1.0],
+            [0.5, 0.5],
+            transform=self.zoom_slider_axis.transAxes,
+            color="#d1d5db",
+            linewidth=4.0,
+            solid_capstyle="round",
+            zorder=1,
+        )
+        (self._zoom_slider_fill_line,) = self.zoom_slider_axis.plot(
+            [0.0, self.zoom_slider.val],
+            [0.5, 0.5],
+            transform=self.zoom_slider_axis.transAxes,
+            color="#0891b2",
+            linewidth=4.0,
+            solid_capstyle="round",
+            zorder=2,
+        )
+        self.zoom_slider._handle.set_zorder(3)
+        self.zoom_slider_axis.set_visible(False)
+        self._sync_zoom_slider_to_current_view()
+        self.zoom_slider.on_changed(self._zoom_slider_changed)
+
+    def _toggle_zoom_slider(self, _event):
+        visible = not self._zoom_slider_visible
+        if visible:
+            self._set_resolution_popup_visible(False)
+        self._set_zoom_slider_visible(visible)
+
+    def _set_zoom_slider_visible(self, visible):
+        self._zoom_slider_visible = bool(visible)
+        self.zoom_slider_axis.set_visible(self._zoom_slider_visible)
+        if self._zoom_slider_visible:
+            self._sync_zoom_slider_to_current_view()
+        self.figure.canvas.draw_idle()
+
+    def _view_width_to_slider_value(self, view_width):
+        bounded_width = min(
+            self.max_view_width,
+            max(self.min_view_width, float(view_width)),
+        )
+        logarithmic_range = math.log(
+            self.max_view_width / self.min_view_width
+        )
+        return math.log(self.max_view_width / bounded_width) / logarithmic_range
+
+    def _slider_value_to_view_width(self, slider_value):
+        value = min(1.0, max(0.0, float(slider_value)))
+        logarithmic_range = math.log(
+            self.max_view_width / self.min_view_width
+        )
+        return self.max_view_width * math.exp(-value * logarithmic_range)
+
+    def _zoom_slider_changed(self, slider_value):
+        if self._updating_zoom_slider:
+            return
+
+        self._update_zoom_slider_fill(slider_value)
+
+        x_min, x_max = self.axis.get_xlim()
+        y_min, y_max = self.axis.get_ylim()
+        center_x = (x_min + x_max) / 2.0
+        center_y = (y_min + y_max) / 2.0
+        new_width = self._slider_value_to_view_width(slider_value)
+        new_height = new_width / self.BEV_ASPECT_RATIO
+
+        self._show_interaction_preview()
+        self._set_axis_limits(
+            (
+                center_x - new_width / 2.0,
+                center_x + new_width / 2.0,
+            ),
+            (
+                center_y - new_height / 2.0,
+                center_y + new_height / 2.0,
+            ),
+        )
+        self._set_zoom_slider_value_text(new_width)
+        self.figure.canvas.draw_idle()
+        self._schedule_full_resolution_restore()
+
+    def _sync_zoom_slider_to_current_view(self):
+        if not hasattr(self, "zoom_slider"):
+            return
+
+        x_min, x_max = self.axis.get_xlim()
+        view_width = abs(x_max - x_min)
+        slider_value = self._view_width_to_slider_value(view_width)
+        if not math.isclose(
+            self.zoom_slider.val,
+            slider_value,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            self._updating_zoom_slider = True
+            try:
+                self.zoom_slider.set_val(slider_value)
+            finally:
+                self._updating_zoom_slider = False
+        self._update_zoom_slider_fill(slider_value)
+        self._set_zoom_slider_value_text(view_width)
+
+    def _update_zoom_slider_fill(self, slider_value):
+        value = min(1.0, max(0.0, float(slider_value)))
+        self._zoom_slider_fill_line.set_xdata([0.0, value])
+
+    def _set_zoom_slider_value_text(self, view_width):
+        zoom_factor = self.full_view_width / float(view_width)
+        self.zoom_slider.valtext.set_text("{:.2f}x".format(zoom_factor))
+
     def _show_interaction_preview(self):
         if (
             self._using_interaction_preview
@@ -687,7 +945,13 @@ class PcdMonitor:
         self._interaction_restore_timer.start()
 
     def _restore_full_resolution_after_interaction(self):
-        if self._drag_state is not None:
+        if (
+            self._drag_state is not None
+            or (
+                hasattr(self, "zoom_slider")
+                and self.zoom_slider.drag_active
+            )
+        ):
             return
         self._show_full_resolution()
         self.figure.canvas.draw_idle()
@@ -950,6 +1214,7 @@ class PcdMonitor:
         min_x, max_x, min_y, max_y = extent
         self.axis.set_xlim(min_x, max_x)
         self.axis.set_ylim(min_y, max_y)
+        self._sync_zoom_slider_to_current_view()
 
     def _on_close(self, _event):
         if not rospy.is_shutdown():
