@@ -611,6 +611,7 @@ class PcdMonitor:
         )
 
         self._zoom_tool_button = QtWidgets.QToolButton(toolbar)
+        self._zoom_tool_button.setObjectName("pcdMenuToolButton")
         self._zoom_tool_button.setText("Zoom")
         self._zoom_tool_button.setPopupMode(instant_popup)
         self._zoom_tool_button.setToolTip(
@@ -624,10 +625,112 @@ class PcdMonitor:
         zoom_layout.setContentsMargins(16, 10, 16, 10)
         zoom_layout.setSpacing(10)
 
-        zoom_out_label = QtWidgets.QLabel("−", zoom_content)
-        zoom_out_label.setObjectName("pcdZoomBoundLabel")
-        zoom_in_label = QtWidgets.QLabel("+", zoom_content)
-        zoom_in_label.setObjectName("pcdZoomBoundLabel")
+        mouse_buttons = getattr(
+            qt_namespace,
+            "MouseButton",
+            qt_namespace,
+        )
+        left_mouse_button = getattr(mouse_buttons, "LeftButton")
+        center_alignment = getattr(alignment, "AlignCenter")
+        pen_styles = getattr(qt_namespace, "PenStyle", qt_namespace)
+        no_pen = getattr(pen_styles, "NoPen")
+        render_hints = getattr(
+            QtGui.QPainter,
+            "RenderHint",
+            QtGui.QPainter,
+        )
+        antialiasing = getattr(render_hints, "Antialiasing")
+
+        class RepeatingZoomLabel(QtWidgets.QLabel):
+            """Keep QLabel rendering while adding click/hold behavior."""
+
+            def __init__(label_self, text, callback, tooltip):
+                super().__init__(text, zoom_content)
+                label_self._callback = callback
+                label_self._left_mouse_button = left_mouse_button
+                label_self._hovered = False
+                label_self._pressed = False
+                label_self._repeat_delay = QtCore.QTimer(label_self)
+                label_self._repeat_delay.setSingleShot(True)
+                label_self._repeat_delay.setInterval(350)
+                label_self._repeat_delay.timeout.connect(
+                    label_self._start_repeat
+                )
+                label_self._repeat_timer = QtCore.QTimer(label_self)
+                label_self._repeat_timer.setInterval(60)
+                label_self._repeat_timer.timeout.connect(callback)
+                label_self.setObjectName("pcdZoomBoundLabel")
+                label_self.setToolTip(tooltip)
+                label_self.setAlignment(center_alignment)
+                label_self.setFixedSize(24, 24)
+
+            def _start_repeat(label_self):
+                label_self._callback()
+                label_self._repeat_timer.start()
+
+            def _stop_repeat(label_self):
+                label_self._repeat_delay.stop()
+                label_self._repeat_timer.stop()
+
+            def mousePressEvent(label_self, event):
+                if event.button() == label_self._left_mouse_button:
+                    label_self._pressed = True
+                    label_self.update()
+                    label_self._callback()
+                    label_self._repeat_delay.start()
+                    event.accept()
+                    return
+                super().mousePressEvent(event)
+
+            def mouseReleaseEvent(label_self, event):
+                label_self._stop_repeat()
+                label_self._pressed = False
+                label_self.update()
+                if event.button() == label_self._left_mouse_button:
+                    event.accept()
+                    return
+                super().mouseReleaseEvent(event)
+
+            def enterEvent(label_self, event):
+                label_self._hovered = True
+                label_self.update()
+                super().enterEvent(event)
+
+            def leaveEvent(label_self, event):
+                label_self._stop_repeat()
+                label_self._hovered = False
+                label_self._pressed = False
+                label_self.update()
+                super().leaveEvent(event)
+
+            def paintEvent(label_self, event):
+                if label_self._hovered or label_self._pressed:
+                    painter = QtGui.QPainter(label_self)
+                    painter.setRenderHint(antialiasing, True)
+                    painter.setPen(no_pen)
+                    painter.setBrush(
+                        QtGui.QColor(
+                            "#dbe4ff"
+                            if label_self._pressed
+                            else "#eef2ff"
+                        )
+                    )
+                    painter.drawEllipse(
+                        label_self.rect().adjusted(1, 1, -1, -1)
+                    )
+                    painter.end()
+                super().paintEvent(event)
+
+        self._qt_zoom_out_button = RepeatingZoomLabel(
+            "−",
+            lambda: self._adjust_zoom_factor(-0.01),
+            "Decrease zoom by 0.01×",
+        )
+        self._qt_zoom_in_button = RepeatingZoomLabel(
+            "+",
+            lambda: self._adjust_zoom_factor(0.01),
+            "Increase zoom by 0.01×",
+        )
         self._qt_zoom_slider = QtWidgets.QSlider(
             horizontal_orientation,
             zoom_content,
@@ -642,9 +745,9 @@ class PcdMonitor:
         self._qt_zoom_value_label.setFixedWidth(58)
         self._qt_zoom_value_label.setAlignment(right_alignment)
 
-        zoom_layout.addWidget(zoom_out_label)
+        zoom_layout.addWidget(self._qt_zoom_out_button)
         zoom_layout.addWidget(self._qt_zoom_slider, 1)
-        zoom_layout.addWidget(zoom_in_label)
+        zoom_layout.addWidget(self._qt_zoom_in_button)
         zoom_layout.addWidget(self._qt_zoom_value_label)
         zoom_content.setMinimumWidth(560)
 
@@ -657,6 +760,7 @@ class PcdMonitor:
         self._qt_zoom_widget_action = zoom_widget_action
 
         self._resolution_tool_button = QtWidgets.QToolButton(toolbar)
+        self._resolution_tool_button.setObjectName("pcdMenuToolButton")
         self._resolution_tool_button.setText("Resolution")
         self._resolution_tool_button.setPopupMode(instant_popup)
         self._resolution_tool_button.setToolTip(
@@ -736,6 +840,12 @@ class PcdMonitor:
             QToolBar#pcdMonitorToolbar QToolButton:pressed {
                 color: #4338ca;
                 background: #eef2ff;
+            }
+            QToolBar#pcdMonitorToolbar
+            QToolButton#pcdMenuToolButton::menu-indicator {
+                image: none;
+                width: 0px;
+                height: 0px;
             }
             QToolBar#pcdMonitorToolbar QToolButton#pcdPrimaryToolButton {
                 color: #ffffff;
@@ -1444,6 +1554,42 @@ class PcdMonitor:
 
     def _zoom_slider_released(self):
         self._finish_interaction(force=True)
+
+    def _adjust_zoom_factor(self, delta):
+        x_min, x_max = self.axis.get_xlim()
+        y_min, y_max = self.axis.get_ylim()
+        current_width = abs(x_max - x_min)
+        current_zoom = self.full_view_width / current_width
+        # Start from the same two-decimal value shown beside the slider so
+        # every click visibly changes that value by exactly 0.01x.
+        displayed_zoom = round(current_zoom * 100.0) / 100.0
+        min_zoom = self.full_view_width / self.max_view_width
+        max_zoom = self.full_view_width / self.min_view_width
+        new_zoom = min(
+            max_zoom,
+            max(min_zoom, displayed_zoom + float(delta)),
+        )
+        new_width = self.full_view_width / new_zoom
+        if math.isclose(new_width, current_width, rel_tol=1e-12):
+            return
+
+        center_x = (x_min + x_max) / 2.0
+        center_y = (y_min + y_max) / 2.0
+        new_height = new_width / self.BEV_ASPECT_RATIO
+        self._begin_interaction()
+        self._set_axis_limits(
+            (
+                center_x - new_width / 2.0,
+                center_x + new_width / 2.0,
+            ),
+            (
+                center_y - new_height / 2.0,
+                center_y + new_height / 2.0,
+            ),
+        )
+        self._sync_zoom_slider_to_current_view()
+        self._update_interaction_overlay()
+        self._schedule_interaction_finish()
 
     def _view_width_to_slider_value(self, view_width):
         bounded_width = min(
