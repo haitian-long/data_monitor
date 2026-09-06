@@ -5,7 +5,7 @@ set -euo pipefail
 DATASET_ROOT="${HOME}/disk/dataset/shangqi/robosense_fairy"
 SEQ="shangqi_fairy_1_fixed_clean"
 MAIN_ALGO="good"
-OURS_ALGO=""
+OURS_ALGO="good3"
 # Optional legend overrides for remaining algorithms only.
 # Unlisted names stay as the TUM suffix (e.g. fast_lio2). Avoid commas.
 declare -A LEGEND_NAMES=(

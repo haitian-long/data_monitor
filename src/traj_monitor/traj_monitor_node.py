@@ -29,7 +29,9 @@ WSLG_XCB_ENABLED = _prefer_xcb_on_wslg()
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.legend_handler import HandlerBase
 from matplotlib.lines import Line2D
+from matplotlib.patches import Polygon
 import numpy as np
 import rospy
 
@@ -48,6 +50,39 @@ from traj_monitor.toolbar_menus import (
     hide_dropdown,
     raise_visible_dropdowns,
 )
+
+
+class _CenteredTriangleHandler(HandlerBase):
+    """Legend triangle whose bounding box is centered on the text row."""
+
+    def create_artists(
+        self,
+        legend,
+        orig_handle,
+        xdescent,
+        ydescent,
+        width,
+        height,
+        fontsize,
+        trans,
+    ):
+        center_x = 0.5 * width - xdescent
+        center_y = 0.5 * height - ydescent
+        size = float(orig_handle.get_markersize())
+        tri_height = size * 0.72
+        half_width = tri_height / math.sqrt(3.0)
+        patch = Polygon(
+            (
+                (center_x, center_y + tri_height / 2.0),
+                (center_x - half_width, center_y - tri_height / 2.0),
+                (center_x + half_width, center_y - tri_height / 2.0),
+            ),
+            closed=True,
+            facecolor=orig_handle.get_color(),
+            edgecolor="none",
+            transform=trans,
+        )
+        return [patch]
 
 
 class TrajMonitor:
@@ -83,8 +118,12 @@ class TrajMonitor:
     ALIGN_MIN_PAIRS = 8
     LEGEND_TITLE_FONTSIZE = 16.0
     LEGEND_ITEM_FONTSIZE = 14.0
+    LEGEND_FONT_FAMILY = "Times New Roman"
+    AXIS_TICK_FONTSIZE = 12.0
+    AXIS_LABEL_FONTSIZE = 13.0
+    AXIS_OFFSET_FONTSIZE = 11.0
     LEGEND_HANDLELENGTH = 2.4
-    LEGEND_HANDLEHEIGHT = 0.7
+    LEGEND_HANDLEHEIGHT = 1.0
     LEGEND_BORDERPAD = 0.35
     LEGEND_LABELSPACING = 0.18
     LEGEND_HANDLETEXTPAD = 0.45
@@ -98,10 +137,10 @@ class TrajMonitor:
         "#9A3412",
         "#0F172A",
     )
-    OURS_TRAJECTORY_COLOR = "#DC2626"
+    OURS_TRAJECTORY_COLOR = "#000000"
     GRID_COLOR = "#94a3b8"
     START_MARKER_COLOR = "#FACC15"
-    START_MARKER_SIZE = 9.0
+    START_MARKER_SIZE = 11.0
     START_MARKER_LABEL = "start"
 
     def __init__(self):
@@ -546,14 +585,20 @@ class TrajMonitor:
         axis.tick_params(
             axis="both",
             colors=self.UI_MUTED_TEXT,
-            labelsize=9,
+            labelsize=self.AXIS_TICK_FONTSIZE,
             length=3.5,
             width=0.8,
         )
         axis.xaxis.label.set_color("#475569")
         axis.yaxis.label.set_color("#475569")
-        axis.xaxis.label.set_fontsize(10)
-        axis.yaxis.label.set_fontsize(10)
+        axis.xaxis.label.set_fontsize(self.AXIS_LABEL_FONTSIZE)
+        axis.yaxis.label.set_fontsize(self.AXIS_LABEL_FONTSIZE)
+        axis.xaxis.label.set_fontweight("bold")
+        axis.yaxis.label.set_fontweight("bold")
+        for tick_label in list(axis.get_xticklabels()) + list(axis.get_yticklabels()):
+            tick_label.set_fontweight("bold")
+        axis.xaxis.offsetText.set_fontweight("bold")
+        axis.yaxis.offsetText.set_fontweight("bold")
         axis.title.set_color(self.UI_TEXT)
         axis.title.set_fontsize(14)
         axis.title.set_fontweight("normal")
@@ -563,6 +608,18 @@ class TrajMonitor:
         figure = self.figure if figure is None else figure
         height_inches = float(figure.get_size_inches()[1])
         return max(height_inches / self.INITIAL_FIGURE_SIZE[1], 0.75)
+
+    def _stroke_points(self, pixel_width, figure=None):
+        """Convert overlay pixel widths to Matplotlib points.
+
+        Overlay pens are device pixels. Use the figure being drawn so a
+        3 px window stroke stays 3 px in a 200 DPI export, not 3 pt.
+        """
+        target = self.figure if figure is None else figure
+        dpi = float(getattr(target, "dpi", None) or self.FIGURE_DPI)
+        if dpi <= 0.0:
+            dpi = float(self.FIGURE_DPI)
+        return float(pixel_width) * 72.0 / dpi
 
     def _style_legend(self, legend, figure=None):
         if legend is None:
@@ -577,10 +634,12 @@ class TrajMonitor:
         if title.get_text():
             title.set_color(self.UI_TEXT)
             title.set_fontsize(self.LEGEND_TITLE_FONTSIZE * scale)
+            title.set_fontname(self.LEGEND_FONT_FAMILY)
             title.set_fontweight("bold")
         for text in legend.get_texts():
             text.set_color(self.UI_TEXT)
             text.set_fontsize(self.LEGEND_ITEM_FONTSIZE * scale)
+            text.set_fontname(self.LEGEND_FONT_FAMILY)
 
     def _refresh_legend(self):
         if getattr(self, "legend", None) is not None:
@@ -871,7 +930,7 @@ class TrajMonitor:
         filter_layout.setSpacing(4)
         self._filter_checkboxes = []
         if self.trajectories:
-            for traj in self.trajectories:
+            for traj in self._order_trajectories(self.trajectories):
                 checkbox = QtWidgets.QCheckBox(traj["label"], filter_content)
                 checkbox.setObjectName("pcdFilterCheckBox")
                 checkbox.setChecked(bool(traj.get("visible", True)))
@@ -912,7 +971,7 @@ class TrajMonitor:
         self._color_editors = []
         self._color_pick_target = None
         if self.trajectories:
-            for traj in self.trajectories:
+            for traj in self._order_trajectories(self.trajectories):
                 row = QtWidgets.QWidget(color_content)
                 row_layout = QtWidgets.QHBoxLayout(row)
                 row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1704,12 +1763,13 @@ class TrajMonitor:
         painter.restore()
 
     def _draw_interaction_legend(self, painter, data_rect):
-        visible = self._visible_trajectories()
+        visible = self._legend_trajectories()
         if not visible and self.start_xy is None:
             return
 
         scale = self._ui_scale()
         font = self._qt_gui.QFont()
+        font.setFamily(self.LEGEND_FONT_FAMILY)
         font.setPointSizeF(self.LEGEND_ITEM_FONTSIZE * scale)
         metrics = self._qt_gui.QFontMetricsF(font)
         pad = 6.0 * scale
@@ -1718,7 +1778,9 @@ class TrajMonitor:
         line_len = 22.0 * scale
         row_height = max(float(metrics.height()) * 1.12, 14.0 * scale)
         text_width = 0.0
-        legend_labels = [traj["label"] for traj in visible]
+        legend_labels = [
+            self._legend_display_label(traj["label"]) for traj in visible
+        ]
         if self.start_xy is not None:
             legend_labels.append(self.START_MARKER_LABEL)
         for label in legend_labels:
@@ -1804,19 +1866,23 @@ class TrajMonitor:
                 text_width,
                 row_height,
             )
-            painter.drawText(text_rect, align_left_center, traj["label"])
+            painter.drawText(
+                text_rect,
+                align_left_center,
+                self._legend_display_label(traj["label"]),
+            )
             y += row_height
         if self.start_xy is not None:
             center_y = y + row_height / 2.0
+            radius = 6.0 * scale
+            # Shift the centroid down so the triangle bbox lines up with the text.
             triangle_center = self._qt_core.QPointF(
                 box.left() + pad + line_len / 2.0,
-                center_y,
+                center_y + radius / 4.0,
             )
             painter.setPen(getattr(pen_styles, "NoPen"))
             painter.setBrush(self._qt_gui.QColor(self.START_MARKER_COLOR))
-            painter.drawPath(
-                self._triangle_path(triangle_center, 6.0 * scale)
-            )
+            painter.drawPath(self._triangle_path(triangle_center, radius))
             painter.setPen(self._qt_gui.QColor(self.UI_TEXT))
             painter.setBrush(getattr(brush_styles, "NoBrush"))
             text_rect = self._qt_core.QRectF(
@@ -1868,7 +1934,8 @@ class TrajMonitor:
         painter.drawRect(data_rect)
 
         tick_font = self._qt_gui.QFont()
-        tick_font.setPointSizeF(9.0)
+        tick_font.setPointSizeF(self.AXIS_TICK_FONTSIZE)
+        tick_font.setBold(True)
         painter.setFont(tick_font)
         painter.setPen(self._qt_gui.QColor(self.UI_MUTED_TEXT))
         tick_metrics = self._qt_gui.QFontMetricsF(tick_font)
@@ -1933,7 +2000,8 @@ class TrajMonitor:
             )
 
         offset_font = self._qt_gui.QFont(tick_font)
-        offset_font.setPointSizeF(8.5)
+        offset_font.setPointSizeF(self.AXIS_OFFSET_FONTSIZE)
+        offset_font.setBold(True)
         painter.setFont(offset_font)
         if x_offset:
             painter.drawText(
@@ -1959,7 +2027,8 @@ class TrajMonitor:
             )
 
         label_font = self._qt_gui.QFont()
-        label_font.setPointSizeF(10.0)
+        label_font.setPointSizeF(self.AXIS_LABEL_FONTSIZE)
+        label_font.setBold(True)
         painter.setFont(label_font)
         painter.setPen(self._qt_gui.QColor("#475569"))
         painter.drawText(
@@ -2325,6 +2394,20 @@ class TrajMonitor:
             traj for traj in self.trajectories if traj.get("visible", True)
         ]
 
+    @staticmethod
+    def _legend_display_label(label):
+        text = str(label)
+        if not text:
+            return text
+        return text[0].upper() + text[1:]
+
+    def _legend_trajectories(self):
+        return [
+            traj
+            for traj in self._order_trajectories(self.trajectories)
+            if traj.get("visible", True)
+        ]
+
     def _set_trajectory_visible(self, traj, visible):
         traj["visible"] = bool(visible)
         line = traj.get("mpl_line")
@@ -2458,7 +2541,7 @@ class TrajMonitor:
             for traj in trajectories
             if not traj["is_main"] and not self._is_ours_loaded(traj)
         ]
-        return mains + ours + others
+        return mains + others + ours
 
     def _draw_order_trajectories(self):
         mains = [traj for traj in self.trajectories if traj["is_main"]]
@@ -2498,7 +2581,7 @@ class TrajMonitor:
                 ours_path,
                 label="ours",
                 color=self.OURS_TRAJECTORY_COLOR,
-                linestyle="--",
+                linestyle="-",
                 linewidth=self.OTHER_TRAJECTORY_LINEWIDTH,
                 is_main=False,
                 is_ours=True,
@@ -2713,16 +2796,20 @@ class TrajMonitor:
             float(chosen["positions"][index, 1]),
         )
 
+    def _start_marker_points(self, figure=None):
+        """Marker size in Matplotlib points; keep visual weight on high-DPI export."""
+        return self.START_MARKER_SIZE * self._ui_scale(figure)
+
     def _draw_start_marker(self, axis, figure=None):
         if self.start_xy is None:
             return None
-        scale = self._ui_scale(axis.figure if figure is None else figure)
+        target_figure = axis.figure if figure is None else figure
         (marker,) = axis.plot(
             [self.start_xy[0]],
             [self.start_xy[1]],
             linestyle="None",
             marker="^",
-            markersize=self.START_MARKER_SIZE * scale,
+            markersize=self._start_marker_points(target_figure),
             color=self.START_MARKER_COLOR,
             markeredgecolor="none",
             markeredgewidth=0.0,
@@ -2736,12 +2823,19 @@ class TrajMonitor:
         for index, traj in enumerate(self._draw_order_trajectories()):
             if axis is not live_axis and not traj.get("visible", True):
                 continue
+            if axis is live_axis:
+                linewidth = traj["linewidth"]
+            else:
+                linewidth = self._stroke_points(
+                    traj["linewidth"],
+                    axis.figure,
+                )
             (line,) = axis.plot(
                 traj["positions"][:, 0],
                 traj["positions"][:, 1],
                 color=traj["color"],
                 linestyle=traj["linestyle"],
-                linewidth=traj["linewidth"],
+                linewidth=linewidth,
                 zorder=5 + index,
                 label=traj["label"],
             )
@@ -2752,48 +2846,54 @@ class TrajMonitor:
         return lines
 
     def _draw_legend(self, axis, figure=None):
-        visible = self._visible_trajectories()
+        visible = self._legend_trajectories()
         if not visible and self.start_xy is None:
             return None
-        scale = self._ui_scale(axis.figure if figure is None else figure)
+        target_figure = axis.figure if figure is None else figure
+        scale = self._ui_scale(target_figure)
         handles = [
             Line2D(
                 [0],
                 [0],
                 color=traj["color"],
                 linestyle=traj["linestyle"],
-                linewidth=max(traj["linewidth"] * scale, 1.5),
-                label=traj["label"],
+                linewidth=self._stroke_points(traj["linewidth"], target_figure),
+                label=self._legend_display_label(traj["label"]),
             )
             for traj in visible
         ]
+        handler_map = None
         if self.start_xy is not None:
-            handles.append(
-                Line2D(
-                    [0],
-                    [0],
-                    linestyle="None",
-                    marker="^",
-                    markersize=self.START_MARKER_SIZE * scale,
-                    color=self.START_MARKER_COLOR,
-                    markeredgecolor="none",
-                    markeredgewidth=0.0,
-                    label=self.START_MARKER_LABEL,
-                )
+            start_handle = Line2D(
+                [0],
+                [0],
+                linestyle="None",
+                marker="^",
+                markersize=self._start_marker_points(target_figure),
+                color=self.START_MARKER_COLOR,
+                markeredgecolor="none",
+                markeredgewidth=0.0,
+                label=self.START_MARKER_LABEL,
             )
+            handles.append(start_handle)
+            handler_map = {start_handle: _CenteredTriangleHandler()}
         return axis.legend(
             handles=handles,
             loc="upper right",
             frameon=True,
             fancybox=False,
             framealpha=0.92,
-            fontsize=self.LEGEND_ITEM_FONTSIZE * scale,
+            prop={
+                "family": self.LEGEND_FONT_FAMILY,
+                "size": self.LEGEND_ITEM_FONTSIZE * scale,
+            },
             handlelength=self.LEGEND_HANDLELENGTH,
             handleheight=self.LEGEND_HANDLEHEIGHT,
             borderpad=self.LEGEND_BORDERPAD,
             labelspacing=self.LEGEND_LABELSPACING,
             handletextpad=self.LEGEND_HANDLETEXTPAD,
             borderaxespad=0.4,
+            handler_map=handler_map,
         )
 
     def _rebuild_clicked(self, _event):
