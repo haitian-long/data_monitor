@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import copy
 import math
 import os
 from pathlib import Path
@@ -29,10 +28,8 @@ WSLG_XCB_ENABLED = _prefer_xcb_on_wslg()
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from matplotlib.lines import Line2D
 import numpy as np
 import rospy
 
@@ -41,12 +38,12 @@ from pcd_monitor.pcd import (
     build_bev,
     extent_for_bounds,
     load_point_cloud,
-    read_tum_trajectory_positions,
+    read_tum_trajectory_poses,
     validate_pcd_file,
 )
 
 
-class PcdMonitor:
+class TrajMonitor:
     BEV_WIDTH = 2560
     BEV_HEIGHT = 1440
     BEV_RESOLUTIONS = (
@@ -58,6 +55,8 @@ class PcdMonitor:
     INITIAL_FIGURE_SIZE = (12.8, 7.2)
     FIGURE_DPI = 100
     INTERACTION_RESTORE_DELAY_MS = 180
+    OVERLAY_TRAJECTORY_MAX_POINTS = 2500
+    OVERLAY_TRAJECTORY_DRAG_MAX_POINTS = 800
     MIN_VIEW_VOXELS = 8.0
     MAX_FULL_VIEW_SCALE = 4.0
     ZOOM_SLIDER_STEPS = 10000
@@ -68,10 +67,34 @@ class PcdMonitor:
     UI_BORDER = "#cbd5e1"
     UI_TEXT = "#0f172a"
     UI_MUTED_TEXT = "#64748b"
-    PLOT_EMPTY_COLOR = "#ffffff"
-    TRAJECTORY_COLOR = "#DC2626"
-    TRAJECTORY_LINEWIDTH = 3.0
+    PLOT_EMPTY_COLOR = "#f3f4f6"
+    PLOT_POINT_COLOR = "#a8a8a8"
+    MAIN_TRAJECTORY_COLOR = "#DC2626"
+    MAIN_TRAJECTORY_LINEWIDTH = 3.0
+    OTHER_TRAJECTORY_LINEWIDTH = 2.2
+    ALIGN_HEADING_DISTANCE = 10.0
+    LEGEND_TITLE_FONTSIZE = 16.0
+    LEGEND_ITEM_FONTSIZE = 14.0
+    LEGEND_HANDLELENGTH = 2.4
+    LEGEND_HANDLEHEIGHT = 0.7
+    LEGEND_BORDERPAD = 0.35
+    LEGEND_LABELSPACING = 0.18
+    LEGEND_HANDLETEXTPAD = 0.45
+    OTHER_TRAJECTORY_COLORS = (
+        "#1D4ED8",
+        "#15803D",
+        "#EA580C",
+        "#CA8A04",
+        "#6D28D9",
+        "#0891B2",
+        "#9A3412",
+        "#0F172A",
+    )
+    OURS_TRAJECTORY_COLOR = "#DC2626"
     GRID_COLOR = "#94a3b8"
+    START_MARKER_COLOR = "#FACC15"
+    START_MARKER_SIZE = 9.0
+    START_MARKER_LABEL = "start"
 
     def __init__(self):
         pcd_path_param = str(rospy.get_param("~pcd_path", "")).strip()
@@ -80,36 +103,11 @@ class PcdMonitor:
                 "~pcd_path is empty; set it to a single PCD file"
             )
         self.pcd_path = validate_pcd_file(pcd_path_param)
-        self.colormap = rospy.get_param("~colormap", "turbo")
         self.voxel_size = float(rospy.get_param("~voxel_size", 0.10))
-        self.title = str(rospy.get_param("~title", "PCD BEV Monitor"))
-        trajectory_path_param = str(
-            rospy.get_param("~trajectory_path", "")
-        ).strip()
-        self.trajectory_path = None
-        self.trajectory_positions = None
-        if trajectory_path_param:
-            self.trajectory_path = Path(trajectory_path_param).expanduser()
-            try:
-                self.trajectory_positions = read_tum_trajectory_positions(
-                    self.trajectory_path
-                )
-            except PcdError as error:
-                rospy.logwarn("Skipping TUM trajectory: %s", error)
-                self.trajectory_path = None
-            else:
-                rospy.loginfo(
-                    "Loaded TUM trajectory: %s (%d poses)",
-                    self.trajectory_path,
-                    self.trajectory_positions.shape[0],
-                )
+        self.title = str(rospy.get_param("~title", "Trajectory BEV Monitor"))
+        self.trajectories = self._load_trajectories()
         self.selected_bev_width = self.BEV_WIDTH
         self.selected_bev_height = self.BEV_HEIGHT
-
-        try:
-            plt.get_cmap(self.colormap)
-        except ValueError as error:
-            raise PcdError("Unknown Matplotlib colormap: {}".format(self.colormap)) from error
 
         rospy.loginfo("Using PCD file: %s", self.pcd_path)
         self.export_dir = self.pcd_path.parent
@@ -132,7 +130,7 @@ class PcdMonitor:
         display_percentiles = self.dataset_stats["display_z_percentiles"]
         display_z_range = self.dataset_stats["display_z_range"]
         rospy.loginfo(
-            "Fixed color range: Z percentile %.0f%%..%.0f%% = %.6g..%.6g m",
+            "Source Z percentile %.0f%%..%.0f%% = %.6g..%.6g m",
             display_percentiles[0],
             display_percentiles[1],
             display_z_range[0],
@@ -181,18 +179,7 @@ class PcdMonitor:
         self.figure.canvas.manager.set_window_title(self.title)
         self._configure_resizable_window()
         self.figure.subplots_adjust(left=0.08, bottom=0.10, right=0.90, top=0.93)
-        plot_position = self.axis.get_position()
-        self.axis.set_position(
-            (
-                (1.0 - plot_position.width) / 2.0,
-                plot_position.y0,
-                plot_position.width,
-                plot_position.height,
-            )
-        )
 
-        colormap = copy.copy(plt.get_cmap(self.colormap))
-        colormap.set_bad(color=self.PLOT_EMPTY_COLOR, alpha=1.0)
         self.image = self.axis.imshow(
             self.bev["rgba_image"],
             origin="upper",
@@ -201,35 +188,16 @@ class PcdMonitor:
             resample=False,
             aspect="equal",
         )
-        self.trajectory_line = self._draw_trajectory(self.axis)
-        # Keep the BEV axes centered in the Figure. A normal colorbar with
-        # ax=self.axis shrinks the main axes toward the left.
+        self.trajectory_lines = self._draw_trajectories(self.axis)
+        self.start_marker = self._draw_start_marker(self.axis)
         self.axis.set_anchor("C")
-        self.colorbar_axis = inset_axes(
-            self.axis,
-            width="2.5%",
-            height="100%",
-            loc="lower left",
-            bbox_to_anchor=(1.02, 0.0, 1.0, 1.0),
-            bbox_transform=self.axis.transAxes,
-            borderpad=0.0,
-        )
-        self.color_mappable = ScalarMappable(
-            norm=self._normalization_for_bev(self.bev),
-            cmap=colormap,
-        )
-        self.color_mappable.set_array([])
-        self.colorbar = self.figure.colorbar(
-            self.color_mappable,
-            cax=self.colorbar_axis,
-        )
-        self.colorbar.set_label("Maximum Z in pixel (m), fixed P1-P99")
+        self.legend = self._draw_legend(self.axis)
 
         self._set_plot_title()
         self.axis.set_xlabel("X (m)")
         self.axis.set_ylabel("Y (m)")
         self.axis.grid(True, color=self.GRID_COLOR, linestyle="--", linewidth=0.45, alpha=0.45)
-        self._style_plot_chrome(self.axis, self.colorbar)
+        self._style_plot_chrome(self.axis, self.legend)
         self._set_axis_extent(self.bev["extent"])
 
         self._create_native_toolbar()
@@ -238,6 +206,7 @@ class PcdMonitor:
         self._bev_qpixmap(self.bev)
 
         canvas = self.figure.canvas
+        self._install_canvas_draw_guards(canvas)
         canvas.mpl_connect("scroll_event", self._on_scroll)
         canvas.mpl_connect("button_press_event", self._on_button_press)
         canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -506,7 +475,7 @@ class PcdMonitor:
             pad=self.TITLE_PAD_POINTS,
         )
 
-    def _style_plot_chrome(self, axis, colorbar):
+    def _style_plot_chrome(self, axis, legend):
         for spine in axis.spines.values():
             spine.set_color(self.UI_BORDER)
             spine.set_linewidth(0.8)
@@ -524,24 +493,46 @@ class PcdMonitor:
         axis.title.set_color(self.UI_TEXT)
         axis.title.set_fontsize(14)
         axis.title.set_fontweight("normal")
+        self._style_legend(legend, figure=axis.figure)
 
-        colorbar.outline.set_edgecolor(self.UI_BORDER)
-        colorbar.outline.set_linewidth(0.8)
-        colorbar.ax.tick_params(
-            colors=self.UI_MUTED_TEXT,
-            labelsize=8.5,
-            length=3.0,
-            width=0.8,
-        )
-        colorbar.ax.yaxis.label.set_color("#475569")
-        colorbar.ax.yaxis.label.set_fontsize(9.5)
+    def _ui_scale(self, figure=None):
+        figure = self.figure if figure is None else figure
+        height_inches = float(figure.get_size_inches()[1])
+        return max(height_inches / self.INITIAL_FIGURE_SIZE[1], 0.75)
+
+    def _style_legend(self, legend, figure=None):
+        if legend is None:
+            return
+        legend.set_zorder(20)
+        scale = self._ui_scale(figure)
+        frame = legend.get_frame()
+        frame.set_facecolor("#ffffff")
+        frame.set_edgecolor(self.UI_BORDER)
+        frame.set_linewidth(0.8 * scale)
+        title = legend.get_title()
+        if title.get_text():
+            title.set_color(self.UI_TEXT)
+            title.set_fontsize(self.LEGEND_TITLE_FONTSIZE * scale)
+            title.set_fontweight("bold")
+        for text in legend.get_texts():
+            text.set_color(self.UI_TEXT)
+            text.set_fontsize(self.LEGEND_ITEM_FONTSIZE * scale)
+
+    def _refresh_legend(self):
+        if getattr(self, "legend", None) is not None:
+            self.legend.remove()
+            self.legend = None
+        if not hasattr(self, "axis"):
+            return
+        self.legend = self._draw_legend(self.axis)
+        self._style_legend(self.legend, figure=self.figure)
 
     def _create_native_toolbar(self):
         try:
             from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
         except ImportError as error:
             raise PcdError(
-                "The native pcd_monitor toolbar requires a Qt Matplotlib backend"
+                "The native traj_monitor toolbar requires a Qt Matplotlib backend"
             ) from error
 
         manager = self.figure.canvas.manager
@@ -553,7 +544,7 @@ class PcdMonitor:
             or not isinstance(toolbar, QtWidgets.QToolBar)
         ):
             raise PcdError(
-                "The native pcd_monitor toolbar requires FigureManagerQT"
+                "The native traj_monitor toolbar requires FigureManagerQT"
             )
 
         qt_namespace = QtCore.Qt
@@ -603,7 +594,7 @@ class PcdMonitor:
         window.removeToolBar(toolbar)
         window.addToolBar(top_tool_bar_area, toolbar)
         toolbar.clear()
-        toolbar.setObjectName("pcdMonitorToolbar")
+        toolbar.setObjectName("trajMonitorToolbar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(text_only_style)
@@ -806,7 +797,7 @@ class PcdMonitor:
         toolbar.addSeparator()
         self._save_action = toolbar.addAction("Save PNG")
         self._save_action.setToolTip(
-            "Save the current BEV, title and colorbar as a PNG beside the PCD file"
+            "Save the current BEV, title and trajectory legend as a PNG beside the PCD file"
         )
         self._save_action.triggered.connect(
             lambda _checked=False: self._save_clicked(None)
@@ -814,7 +805,7 @@ class PcdMonitor:
 
         self._save_tiff_action = toolbar.addAction("Save TIFF")
         self._save_tiff_action.setToolTip(
-            "Save the current BEV, title and colorbar as a TIFF beside the PCD file"
+            "Save the current BEV, title and trajectory legend as a TIFF beside the PCD file"
         )
         self._save_tiff_action.triggered.connect(
             lambda _checked=False: self._save_tiff_clicked(None)
@@ -833,14 +824,14 @@ class PcdMonitor:
 
         toolbar.setStyleSheet(
             """
-            QToolBar#pcdMonitorToolbar {
+            QToolBar#trajMonitorToolbar {
                 background: #ffffff;
                 border: none;
                 border-bottom: 1px solid #e2e8f0;
                 spacing: 4px;
                 padding: 6px 10px;
             }
-            QToolBar#pcdMonitorToolbar QToolButton {
+            QToolBar#trajMonitorToolbar QToolButton {
                 color: #334155;
                 background: transparent;
                 border: none;
@@ -848,31 +839,31 @@ class PcdMonitor:
                 padding: 7px 11px;
                 font-weight: 600;
             }
-            QToolBar#pcdMonitorToolbar QToolButton:hover,
-            QToolBar#pcdMonitorToolbar QToolButton:pressed {
+            QToolBar#trajMonitorToolbar QToolButton:hover,
+            QToolBar#trajMonitorToolbar QToolButton:pressed {
                 color: #4338ca;
                 background: #eef2ff;
             }
-            QToolBar#pcdMonitorToolbar
+            QToolBar#trajMonitorToolbar
             QToolButton#pcdMenuToolButton::menu-indicator {
                 image: none;
                 width: 0px;
                 height: 0px;
             }
-            QToolBar#pcdMonitorToolbar QToolButton#pcdPrimaryToolButton {
+            QToolBar#trajMonitorToolbar QToolButton#pcdPrimaryToolButton {
                 color: #ffffff;
                 background: #4f46e5;
                 padding-left: 15px;
                 padding-right: 15px;
             }
-            QToolBar#pcdMonitorToolbar
+            QToolBar#trajMonitorToolbar
             QToolButton#pcdPrimaryToolButton:hover,
-            QToolBar#pcdMonitorToolbar
+            QToolBar#trajMonitorToolbar
             QToolButton#pcdPrimaryToolButton:pressed {
                 color: #ffffff;
                 background: #4338ca;
             }
-            QToolBar#pcdMonitorToolbar QToolBarSeparator {
+            QToolBar#trajMonitorToolbar QToolBarSeparator {
                 background: #e2e8f0;
                 width: 1px;
                 margin: 7px 6px;
@@ -979,6 +970,7 @@ class PcdMonitor:
                 plot_position.height,
             )
         )
+        self._refresh_legend()
 
     def _create_interaction_overlay(self):
         from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
@@ -1014,7 +1006,7 @@ class PcdMonitor:
             self.figure.canvas
         )
         self._interaction_data_rect = QtCore.QRectF()
-        self._trajectory_qpath = self._build_trajectory_qpath()
+        self._trajectory_qitems = self._build_trajectory_qitems()
 
         alignments = getattr(
             QtCore.Qt,
@@ -1075,12 +1067,6 @@ class PcdMonitor:
             max(tight_bottom + 6.0, axis_bottom + 64.0),
         )
 
-        # Keep the independently rendered colorbar visible beside the
-        # interaction layer.
-        colorbar_left = float(self.colorbar_axis.bbox.x0) * scale_x
-        if colorbar_left > axis_right:
-            overlay_right = min(overlay_right, colorbar_left - 2.0)
-
         geometry = self._qt_core.QRect(
             int(math.floor(overlay_left)),
             int(math.floor(overlay_top)),
@@ -1131,7 +1117,9 @@ class PcdMonitor:
             x_ticks,
             y_ticks,
         )
-        self._draw_interaction_trajectory(painter, data_rect)
+        self._draw_interaction_trajectories(painter, data_rect)
+        self._draw_interaction_start_marker(painter, data_rect)
+        self._draw_interaction_legend(painter, data_rect)
         self._draw_interaction_axes(
             painter,
             data_rect,
@@ -1277,13 +1265,20 @@ class PcdMonitor:
                 )
         painter.restore()
 
-    def _build_trajectory_qpath(self):
-        if self.trajectory_positions is None:
-            return None
+    def _decimate_positions(self, positions, max_points):
+        if positions is None or positions.shape[0] <= max_points:
+            return positions
+        stride = max(1, int(math.ceil(positions.shape[0] / float(max_points))))
+        sampled = positions[::stride]
+        last = positions[-1]
+        if sampled[-1, 0] != last[0] or sampled[-1, 1] != last[1]:
+            sampled = np.vstack((sampled, last[None, :]))
+        return sampled
 
+    def _positions_to_qpath(self, positions):
         path = self._qt_gui.QPainterPath()
         path_started = False
-        for x_value, y_value in self.trajectory_positions[:, :2]:
+        for x_value, y_value in positions[:, :2]:
             if not math.isfinite(x_value) or not math.isfinite(y_value):
                 path_started = False
                 continue
@@ -1294,8 +1289,30 @@ class PcdMonitor:
                 path_started = True
         return path
 
-    def _draw_interaction_trajectory(self, painter, data_rect):
-        if self._trajectory_qpath is None:
+    def _build_trajectory_qitems(self):
+        items = []
+        for traj in self._draw_order_trajectories():
+            items.append(
+                (
+                    self._positions_to_qpath(
+                        self._decimate_positions(
+                            traj["positions"],
+                            self.OVERLAY_TRAJECTORY_MAX_POINTS,
+                        )
+                    ),
+                    self._positions_to_qpath(
+                        self._decimate_positions(
+                            traj["positions"],
+                            self.OVERLAY_TRAJECTORY_DRAG_MAX_POINTS,
+                        )
+                    ),
+                    traj,
+                )
+            )
+        return items
+
+    def _draw_interaction_trajectories(self, painter, data_rect):
+        if not self._trajectory_qitems:
             return
 
         view_min_x, view_max_x = self.axis.get_xlim()
@@ -1310,16 +1327,234 @@ class PcdMonitor:
             data_rect.left() - scale_x * view_min_x,
             data_rect.top() + scale_y * view_max_y,
         )
-        trajectory_pen = self._qt_gui.QPen(
-            self._qt_gui.QColor(self.TRAJECTORY_COLOR)
+        pen_styles = getattr(
+            self._qt_core.Qt,
+            "PenStyle",
+            self._qt_core.Qt,
         )
-        trajectory_pen.setWidthF(self.TRAJECTORY_LINEWIDTH)
-        trajectory_pen.setCosmetic(True)
+        interacting = bool(self._interaction_active or self._drag_state)
         painter.save()
         painter.setClipRect(data_rect)
-        painter.setPen(trajectory_pen)
+        painter.setRenderHint(
+            getattr(
+                getattr(
+                    self._qt_gui.QPainter,
+                    "RenderHint",
+                    self._qt_gui.QPainter,
+                ),
+                "Antialiasing",
+            ),
+            not interacting,
+        )
         painter.setTransform(transform, True)
-        painter.drawPath(self._trajectory_qpath)
+        for full_path, drag_path, traj in self._trajectory_qitems:
+            trajectory_pen = self._qt_gui.QPen(
+                self._qt_gui.QColor(traj["color"])
+            )
+            trajectory_pen.setWidthF(traj["linewidth"])
+            trajectory_pen.setCosmetic(True)
+            if interacting or traj["linestyle"] != "--":
+                trajectory_pen.setStyle(getattr(pen_styles, "SolidLine"))
+            else:
+                trajectory_pen.setStyle(getattr(pen_styles, "DashLine"))
+            painter.setPen(trajectory_pen)
+            painter.drawPath(drag_path if interacting else full_path)
+        painter.restore()
+
+    def _triangle_path(self, center, radius):
+        path = self._qt_gui.QPainterPath()
+        half_width = radius * math.sqrt(3.0) / 2.0
+        path.moveTo(
+            self._qt_core.QPointF(center.x(), center.y() - radius)
+        )
+        path.lineTo(
+            self._qt_core.QPointF(
+                center.x() - half_width,
+                center.y() + radius / 2.0,
+            )
+        )
+        path.lineTo(
+            self._qt_core.QPointF(
+                center.x() + half_width,
+                center.y() + radius / 2.0,
+            )
+        )
+        path.closeSubpath()
+        return path
+
+    def _draw_interaction_start_marker(self, painter, data_rect):
+        if self.start_xy is None:
+            return
+        view_min_x, view_max_x = self.axis.get_xlim()
+        view_min_y, view_max_y = self.axis.get_ylim()
+        start_x, start_y = self.start_xy
+        if not (
+            view_min_x <= start_x <= view_max_x
+            and view_min_y <= start_y <= view_max_y
+        ):
+            return
+        pixel_x = data_rect.left() + (
+            (start_x - view_min_x)
+            / (view_max_x - view_min_x)
+            * data_rect.width()
+        )
+        pixel_y = data_rect.bottom() - (
+            (start_y - view_min_y)
+            / (view_max_y - view_min_y)
+            * data_rect.height()
+        )
+        radius = 7.0 * self._ui_scale()
+        center = self._qt_core.QPointF(pixel_x, pixel_y)
+        fill = self._qt_gui.QColor(self.START_MARKER_COLOR)
+        pen_styles = getattr(
+            self._qt_core.Qt,
+            "PenStyle",
+            self._qt_core.Qt,
+        )
+        painter.save()
+        painter.setClipRect(data_rect)
+        painter.setRenderHint(
+            getattr(
+                getattr(
+                    self._qt_gui.QPainter,
+                    "RenderHint",
+                    self._qt_gui.QPainter,
+                ),
+                "Antialiasing",
+            ),
+            True,
+        )
+        painter.setPen(getattr(pen_styles, "NoPen"))
+        painter.setBrush(fill)
+        painter.drawPath(self._triangle_path(center, radius))
+        painter.restore()
+
+    def _draw_interaction_legend(self, painter, data_rect):
+        if not self.trajectories:
+            return
+
+        scale = self._ui_scale()
+        font = self._qt_gui.QFont()
+        font.setPointSizeF(self.LEGEND_ITEM_FONTSIZE * scale)
+        metrics = self._qt_gui.QFontMetricsF(font)
+        pad = 6.0 * scale
+        margin = 8.0 * scale
+        gap = 5.0 * scale
+        line_len = 22.0 * scale
+        row_height = max(float(metrics.height()) * 1.12, 14.0 * scale)
+        text_width = 0.0
+        legend_labels = [traj["label"] for traj in self.trajectories]
+        if self.start_xy is not None:
+            legend_labels.append(self.START_MARKER_LABEL)
+        for label in legend_labels:
+            text_width = max(
+                text_width,
+                float(metrics.horizontalAdvance(label)),
+            )
+        box_width = pad + line_len + gap + text_width + pad
+        box_height = pad + row_height * len(legend_labels) + pad
+        box = self._qt_core.QRectF(
+            data_rect.right() - margin - box_width,
+            data_rect.top() + margin,
+            box_width,
+            box_height,
+        )
+        box = box.intersected(data_rect)
+        if box.width() <= 8.0 or box.height() <= 8.0:
+            return
+
+        fill = self._qt_gui.QColor("#ffffff")
+        fill.setAlphaF(0.92)
+        border_pen = self._qt_gui.QPen(self._qt_gui.QColor(self.UI_BORDER))
+        border_pen.setWidthF(max(0.8 * scale, 1.0))
+        brush_styles = getattr(
+            self._qt_core.Qt,
+            "BrushStyle",
+            self._qt_core.Qt,
+        )
+        pen_styles = getattr(
+            self._qt_core.Qt,
+            "PenStyle",
+            self._qt_core.Qt,
+        )
+        alignments = getattr(
+            self._qt_core.Qt,
+            "AlignmentFlag",
+            self._qt_core.Qt,
+        )
+        align_left_center = (
+            getattr(alignments, "AlignLeft")
+            | getattr(alignments, "AlignVCenter")
+        )
+
+        painter.save()
+        painter.setRenderHint(
+            getattr(
+                getattr(
+                    self._qt_gui.QPainter,
+                    "RenderHint",
+                    self._qt_gui.QPainter,
+                ),
+                "Antialiasing",
+            ),
+            True,
+        )
+        painter.setPen(border_pen)
+        painter.setBrush(fill)
+        painter.drawRect(box)
+
+        painter.setFont(font)
+        y = box.top() + pad
+        for traj in self.trajectories:
+            center_y = y + row_height / 2.0
+            line_left = box.left() + pad
+            line_right = line_left + line_len
+            line_pen = self._qt_gui.QPen(self._qt_gui.QColor(traj["color"]))
+            line_pen.setWidthF(max(traj["linewidth"] * scale, 1.8))
+            line_pen.setCosmetic(True)
+            if traj["linestyle"] == "--":
+                line_pen.setStyle(getattr(pen_styles, "DashLine"))
+            else:
+                line_pen.setStyle(getattr(pen_styles, "SolidLine"))
+            painter.setPen(line_pen)
+            painter.drawLine(
+                self._qt_core.QPointF(line_left, center_y),
+                self._qt_core.QPointF(line_right, center_y),
+            )
+            painter.setPen(self._qt_gui.QColor(self.UI_TEXT))
+            painter.setBrush(getattr(brush_styles, "NoBrush"))
+            text_rect = self._qt_core.QRectF(
+                line_right + gap,
+                y,
+                text_width,
+                row_height,
+            )
+            painter.drawText(text_rect, align_left_center, traj["label"])
+            y += row_height
+        if self.start_xy is not None:
+            center_y = y + row_height / 2.0
+            triangle_center = self._qt_core.QPointF(
+                box.left() + pad + line_len / 2.0,
+                center_y,
+            )
+            painter.setPen(getattr(pen_styles, "NoPen"))
+            painter.setBrush(self._qt_gui.QColor(self.START_MARKER_COLOR))
+            painter.drawPath(
+                self._triangle_path(triangle_center, 6.0 * scale)
+            )
+            painter.setPen(self._qt_gui.QColor(self.UI_TEXT))
+            painter.setBrush(getattr(brush_styles, "NoBrush"))
+            text_rect = self._qt_core.QRectF(
+                box.left() + pad + line_len + gap,
+                y,
+                text_width,
+                row_height,
+            )
+            painter.drawText(
+                text_rect,
+                align_left_center,
+                self.START_MARKER_LABEL,
+            )
         painter.restore()
 
     def _draw_interaction_axes(
@@ -1500,6 +1735,23 @@ class PcdMonitor:
             self.title,
         )
 
+    def _install_canvas_draw_guards(self, canvas):
+        self._raw_canvas_draw = canvas.draw
+        self._raw_canvas_draw_idle = canvas.draw_idle
+
+        def _guarded_draw(*args, **kwargs):
+            if self._interaction_active:
+                return None
+            return self._raw_canvas_draw(*args, **kwargs)
+
+        def _guarded_draw_idle(*args, **kwargs):
+            if self._interaction_active:
+                return None
+            return self._raw_canvas_draw_idle(*args, **kwargs)
+
+        canvas.draw = _guarded_draw
+        canvas.draw_idle = _guarded_draw_idle
+
     def _begin_interaction(self):
         if self._interaction_active:
             return
@@ -1535,11 +1787,11 @@ class PcdMonitor:
             return False
 
         self._interaction_restore_timer.stop()
+        self._interaction_active = False
         if draw:
             # Synchronize Matplotlib behind the persistent Qt plot layer.
             # The screen never switches renderers when interaction ends.
-            self.figure.canvas.draw()
-        self._interaction_active = False
+            self._raw_canvas_draw()
         self._interaction_overlay.raise_()
         self._interaction_overlay.update()
         return True
@@ -1744,18 +1996,6 @@ class PcdMonitor:
             right=0.93,
             top=0.91,
         )
-        plot_position = export_axis.get_position()
-        export_axis.set_position(
-            (
-                (1.0 - plot_position.width) / 2.0,
-                plot_position.y0,
-                plot_position.width,
-                plot_position.height,
-            )
-        )
-
-        colormap = copy.copy(plt.get_cmap(self.colormap))
-        colormap.set_bad(color=self.PLOT_EMPTY_COLOR, alpha=1.0)
         export_axis.imshow(
             self.bev["rgba_image"],
             origin="upper",
@@ -1764,27 +2004,10 @@ class PcdMonitor:
             resample=False,
             aspect="equal",
         )
-        self._draw_trajectory(export_axis)
+        self._draw_trajectories(export_axis)
+        self._draw_start_marker(export_axis)
         export_axis.set_anchor("C")
-        export_colorbar_axis = inset_axes(
-            export_axis,
-            width="2.5%",
-            height="100%",
-            loc="lower left",
-            bbox_to_anchor=(1.02, 0.0, 1.0, 1.0),
-            bbox_transform=export_axis.transAxes,
-            borderpad=0.0,
-        )
-        export_mappable = ScalarMappable(
-            norm=self._normalization_for_bev(self.bev),
-            cmap=colormap,
-        )
-        export_mappable.set_array([])
-        export_colorbar = export_figure.colorbar(
-            export_mappable,
-            cax=export_colorbar_axis,
-        )
-        export_colorbar.set_label("Maximum Z in pixel (m), fixed P1-P99")
+        export_legend = self._draw_legend(export_axis, figure=export_figure)
 
         export_axis.set_title(self.title, pad=self.TITLE_PAD_POINTS)
         export_axis.set_xlabel("X (m)")
@@ -1796,23 +2019,332 @@ class PcdMonitor:
             linewidth=0.45,
             alpha=0.45,
         )
-        self._style_plot_chrome(export_axis, export_colorbar)
+        self._style_plot_chrome(export_axis, export_legend)
         export_axis.set_xlim(self.axis.get_xlim())
         export_axis.set_ylim(self.axis.get_ylim())
         return export_figure
 
-    def _draw_trajectory(self, axis):
-        if self.trajectory_positions is None:
-            return None
+    def _parse_path_list(self, value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            items = value
+        else:
+            text = str(value).strip()
+            if not text:
+                return []
+            items = text.replace(";", ",").split(",")
+        paths = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                paths.append(text)
+        return paths
 
-        (line,) = axis.plot(
-            self.trajectory_positions[:, 0],
-            self.trajectory_positions[:, 1],
-            color=self.TRAJECTORY_COLOR,
-            linewidth=self.TRAJECTORY_LINEWIDTH,
-            zorder=5,
+    def _is_ours_loaded(self, traj):
+        return bool(traj.get("is_ours"))
+
+    def _order_trajectories(self, trajectories):
+        mains = [traj for traj in trajectories if traj["is_main"]]
+        ours = [
+            traj
+            for traj in trajectories
+            if not traj["is_main"] and self._is_ours_loaded(traj)
+        ]
+        others = [
+            traj
+            for traj in trajectories
+            if not traj["is_main"] and not self._is_ours_loaded(traj)
+        ]
+        return mains + ours + others
+
+    def _draw_order_trajectories(self):
+        mains = [traj for traj in self.trajectories if traj["is_main"]]
+        ours = [
+            traj
+            for traj in self.trajectories
+            if not traj["is_main"] and self._is_ours_loaded(traj)
+        ]
+        others = [
+            traj
+            for traj in self.trajectories
+            if not traj["is_main"] and not self._is_ours_loaded(traj)
+        ]
+        return others + ours + mains
+
+    def _load_trajectories(self):
+        trajectories = []
+        benchmark_path = str(
+            rospy.get_param("~benchmark_trajectory_path", "")
+        ).strip()
+        if benchmark_path:
+            trajectory = self._read_trajectory(
+                benchmark_path,
+                label="benchmark",
+                color=self.MAIN_TRAJECTORY_COLOR,
+                linestyle="-",
+                linewidth=self.MAIN_TRAJECTORY_LINEWIDTH,
+                is_main=True,
+                is_ours=False,
+            )
+            if trajectory is not None:
+                trajectories.append(trajectory)
+
+        ours_path = str(rospy.get_param("~ours_trajectory_path", "")).strip()
+        if ours_path:
+            trajectory = self._read_trajectory(
+                ours_path,
+                label="ours",
+                color=self.OURS_TRAJECTORY_COLOR,
+                linestyle="--",
+                linewidth=self.OTHER_TRAJECTORY_LINEWIDTH,
+                is_main=False,
+                is_ours=True,
+            )
+            if trajectory is not None:
+                trajectories.append(trajectory)
+
+        other_paths = self._parse_path_list(
+            rospy.get_param("~other_trajectory_paths", "")
         )
-        return line
+        other_names = self._parse_path_list(
+            rospy.get_param("~other_trajectory_names", "")
+        )
+        for index, path_param in enumerate(other_paths):
+            label = other_names[index] if index < len(other_names) else ""
+            trajectory = self._read_trajectory(
+                path_param,
+                label=label,
+                color=self.OTHER_TRAJECTORY_COLORS[
+                    index % len(self.OTHER_TRAJECTORY_COLORS)
+                ],
+                linestyle="--",
+                linewidth=self.OTHER_TRAJECTORY_LINEWIDTH,
+                is_main=False,
+                is_ours=False,
+            )
+            if trajectory is not None:
+                trajectories.append(trajectory)
+        trajectories = self._align_other_trajectories(trajectories)
+        trajectories = self._order_trajectories(trajectories)
+        self.start_xy = self._trajectory_start_xy(trajectories)
+        return trajectories
+
+    def _read_trajectory(
+        self,
+        path_param,
+        label,
+        color,
+        linestyle,
+        linewidth,
+        is_main,
+        is_ours=False,
+    ):
+        path = Path(path_param).expanduser()
+        try:
+            timestamps, positions, quaternions = read_tum_trajectory_poses(path)
+        except PcdError as error:
+            rospy.logwarn("Skipping TUM trajectory: %s", error)
+            return None
+        if not label:
+            if is_main:
+                label = "benchmark"
+            elif is_ours:
+                label = "ours"
+            else:
+                label = path.stem
+        rospy.loginfo(
+            "Loaded %s TUM trajectory: %s (%d poses, label=%s)",
+            "main" if is_main else "ours" if is_ours else "other",
+            path,
+            positions.shape[0],
+            label,
+        )
+        return {
+            "path": path,
+            "timestamps": timestamps,
+            "positions": positions,
+            "quaternions": quaternions,
+            "label": label,
+            "color": color,
+            "linestyle": linestyle,
+            "linewidth": linewidth,
+            "is_main": is_main,
+            "is_ours": is_ours,
+        }
+
+    @staticmethod
+    def _start_pose_index(timestamps):
+        for index, timestamp in enumerate(timestamps):
+            if timestamp > 0.0:
+                return index
+        return 0
+
+    @staticmethod
+    def _travel_heading(positions, start_index, distance):
+        origin = positions[start_index, :2]
+        for index in range(start_index + 1, positions.shape[0]):
+            delta = positions[index, :2] - origin
+            if float(np.linalg.norm(delta)) >= distance:
+                return math.atan2(float(delta[1]), float(delta[0]))
+
+        relative = positions[start_index:, :2] - origin
+        if relative.shape[0] == 0:
+            return 0.0
+        farthest = int(np.argmax(np.linalg.norm(relative, axis=1)))
+        delta = relative[farthest]
+        if float(np.linalg.norm(delta)) < 1e-6:
+            return 0.0
+        return math.atan2(float(delta[1]), float(delta[0]))
+
+    def _align_other_trajectories(self, trajectories):
+        mains = [traj for traj in trajectories if traj["is_main"]]
+        if not mains:
+            return trajectories
+
+        main = mains[0]
+        main_index = self._start_pose_index(main["timestamps"])
+        ref_position = main["positions"][main_index]
+        ref_yaw = self._travel_heading(
+            main["positions"],
+            main_index,
+            self.ALIGN_HEADING_DISTANCE,
+        )
+        rospy.loginfo(
+            "Aligning other trajectories to %s start pose: "
+            "xy=[%.4f, %.4f] m, travel yaw=%.3f deg (first %.1f m)",
+            main["label"],
+            float(ref_position[0]),
+            float(ref_position[1]),
+            math.degrees(ref_yaw),
+            self.ALIGN_HEADING_DISTANCE,
+        )
+
+        for traj in trajectories:
+            if traj["is_main"]:
+                continue
+            start_index = self._start_pose_index(traj["timestamps"])
+            src_position = traj["positions"][start_index]
+            src_yaw = self._travel_heading(
+                traj["positions"],
+                start_index,
+                self.ALIGN_HEADING_DISTANCE,
+            )
+            delta_yaw = ref_yaw - src_yaw
+            cos_yaw = math.cos(delta_yaw)
+            sin_yaw = math.sin(delta_yaw)
+            relative_xy = traj["positions"][:, :2] - src_position[:2]
+            aligned = np.empty_like(traj["positions"])
+            aligned[:, 0] = (
+                cos_yaw * relative_xy[:, 0]
+                - sin_yaw * relative_xy[:, 1]
+                + ref_position[0]
+            )
+            aligned[:, 1] = (
+                sin_yaw * relative_xy[:, 0]
+                + cos_yaw * relative_xy[:, 1]
+                + ref_position[1]
+            )
+            aligned[:, 2] = (
+                traj["positions"][:, 2] - src_position[2] + ref_position[2]
+            )
+            traj["positions"] = np.ascontiguousarray(aligned)
+            rospy.loginfo(
+                "Aligned %s to %s: start dxy=[%.4f, %.4f] m, dyaw=%.3f deg",
+                traj["label"],
+                main["label"],
+                float(ref_position[0] - src_position[0]),
+                float(ref_position[1] - src_position[1]),
+                math.degrees(delta_yaw),
+            )
+        return trajectories
+
+    def _trajectory_start_xy(self, trajectories):
+        mains = [traj for traj in trajectories if traj["is_main"]]
+        chosen = mains[0] if mains else (trajectories[0] if trajectories else None)
+        if chosen is None:
+            return None
+        index = self._start_pose_index(chosen["timestamps"])
+        return (
+            float(chosen["positions"][index, 0]),
+            float(chosen["positions"][index, 1]),
+        )
+
+    def _draw_start_marker(self, axis, figure=None):
+        if self.start_xy is None:
+            return None
+        scale = self._ui_scale(axis.figure if figure is None else figure)
+        (marker,) = axis.plot(
+            [self.start_xy[0]],
+            [self.start_xy[1]],
+            linestyle="None",
+            marker="^",
+            markersize=self.START_MARKER_SIZE * scale,
+            color=self.START_MARKER_COLOR,
+            markeredgecolor="none",
+            markeredgewidth=0.0,
+            zorder=12,
+        )
+        return marker
+
+    def _draw_trajectories(self, axis):
+        lines = []
+        for index, traj in enumerate(self._draw_order_trajectories()):
+            (line,) = axis.plot(
+                traj["positions"][:, 0],
+                traj["positions"][:, 1],
+                color=traj["color"],
+                linestyle=traj["linestyle"],
+                linewidth=traj["linewidth"],
+                zorder=5 + index,
+                label=traj["label"],
+            )
+            lines.append(line)
+        return lines
+
+    def _draw_legend(self, axis, figure=None):
+        if not self.trajectories:
+            return None
+        scale = self._ui_scale(axis.figure if figure is None else figure)
+        handles = [
+            Line2D(
+                [0],
+                [0],
+                color=traj["color"],
+                linestyle=traj["linestyle"],
+                linewidth=max(traj["linewidth"] * scale, 1.5),
+                label=traj["label"],
+            )
+            for traj in self.trajectories
+        ]
+        if self.start_xy is not None:
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    linestyle="None",
+                    marker="^",
+                    markersize=self.START_MARKER_SIZE * scale,
+                    color=self.START_MARKER_COLOR,
+                    markeredgecolor="none",
+                    markeredgewidth=0.0,
+                    label=self.START_MARKER_LABEL,
+                )
+            )
+        return axis.legend(
+            handles=handles,
+            loc="upper right",
+            frameon=True,
+            fancybox=False,
+            framealpha=0.92,
+            fontsize=self.LEGEND_ITEM_FONTSIZE * scale,
+            handlelength=self.LEGEND_HANDLELENGTH,
+            handleheight=self.LEGEND_HANDLEHEIGHT,
+            borderpad=self.LEGEND_BORDERPAD,
+            labelspacing=self.LEGEND_LABELSPACING,
+            handletextpad=self.LEGEND_HANDLETEXTPAD,
+            borderaxespad=0.4,
+        )
 
     def _rebuild_clicked(self, _event):
         self._finish_interaction(force=True)
@@ -1861,8 +2393,6 @@ class PcdMonitor:
         self._bev_qpixmap(bev)
         self.image.set_data(bev["rgba_image"])
         self.image.set_extent(bev["extent"])
-        self.color_mappable.set_norm(self._normalization_for_bev(bev))
-        self.colorbar.update_normal(self.color_mappable)
         self._set_plot_title()
         self._set_axis_extent(bev["extent"])
         self._interaction_overlay.raise_()
@@ -1871,7 +2401,6 @@ class PcdMonitor:
     def _log_bev_info(self, label, bev):
         min_x, max_x, min_y, max_y = bev["extent"]
         min_z, max_z = bev["xyz_bounds"][2]
-        color_min_z, color_max_z = bev["display_z_range"]
         rospy.loginfo(
             "%s: %d x %d, %.6g m/pixel, voxel %.6g m, "
             "%d/%d sampled points in view, %d occupied pixels, "
@@ -1888,7 +2417,7 @@ class PcdMonitor:
         )
         rospy.loginfo(
             "%s ranges: X [%.6g, %.6g] m, Y [%.6g, %.6g] m, "
-            "source Z [%.6g, %.6g] m, fixed color Z [%.6g, %.6g] m",
+            "source Z [%.6g, %.6g] m",
             label,
             min_x,
             max_x,
@@ -1896,29 +2425,29 @@ class PcdMonitor:
             max_y,
             min_z,
             max_z,
-            color_min_z,
-            color_max_z,
         )
 
-    def _normalization_for_bev(self, bev):
-        value_min, value_max = bev["display_z_range"]
-        if value_min == value_max:
-            padding = max(abs(value_min) * 0.01, 0.01)
-            value_min -= padding
-            value_max += padding
-        return Normalize(vmin=value_min, vmax=value_max, clip=True)
+    @staticmethod
+    def _hex_to_rgba(hex_color):
+        value = hex_color.lstrip("#")
+        return np.array(
+            (
+                int(value[0:2], 16),
+                int(value[2:4], 16),
+                int(value[4:6], 16),
+                255,
+            ),
+            dtype=np.uint8,
+        )
 
     def _build_bev_image(self, bev):
         if "rgba_image" in bev:
             return
 
-        colormap = copy.copy(plt.get_cmap(self.colormap))
-        colormap.set_bad(color=self.PLOT_EMPTY_COLOR, alpha=1.0)
-        masked_grid = np.ma.masked_invalid(bev["grid"])
-        rgba_bottom_up = colormap(
-            self._normalization_for_bev(bev)(masked_grid),
-            bytes=True,
-        )
+        occupied = np.isfinite(bev["grid"])
+        rgba_bottom_up = np.empty(occupied.shape + (4,), dtype=np.uint8)
+        rgba_bottom_up[...] = self._hex_to_rgba(self.PLOT_EMPTY_COLOR)
+        rgba_bottom_up[occupied] = self._hex_to_rgba(self.PLOT_POINT_COLOR)
         # Store rows in display order (top to bottom). Matplotlib uses
         # origin="upper" and Qt can consume the same contiguous RGBA buffer.
         bev["rgba_image"] = np.ascontiguousarray(rgba_bottom_up[::-1])
@@ -1931,7 +2460,7 @@ class PcdMonitor:
 
     def _on_close(self, _event):
         if not rospy.is_shutdown():
-            rospy.signal_shutdown("PCD monitor window closed")
+            rospy.signal_shutdown("Trajectory monitor window closed")
 
     def _close_figure(self):
         if hasattr(self, "figure"):
@@ -1944,11 +2473,11 @@ class PcdMonitor:
 
 
 def main():
-    rospy.init_node("pcd_monitor")
+    rospy.init_node("traj_monitor")
     try:
-        monitor = PcdMonitor()
+        monitor = TrajMonitor()
     except (PcdError, ValueError) as error:
-        rospy.logfatal("Could not start pcd_monitor: %s", error)
+        rospy.logfatal("Could not start traj_monitor: %s", error)
         return 1
     monitor.show()
     return 0

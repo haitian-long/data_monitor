@@ -14,15 +14,17 @@ class PcdError(RuntimeError):
     pass
 
 
-def read_tum_trajectory_positions(input_path):
-    """Read XYZ positions from a TUM trajectory file."""
+def read_tum_trajectory_poses(input_path):
+    """Read timestamp, XYZ and quaternion (qx qy qz qw) from a TUM file."""
     path = Path(input_path).expanduser()
     if not path.exists():
         raise PcdError("TUM trajectory file does not exist: {}".format(path))
     if not path.is_file():
         raise PcdError("TUM trajectory path is not a file: {}".format(path))
 
+    timestamps = []
     positions = []
+    quaternions = []
     try:
         with path.open("r", encoding="utf-8-sig") as stream:
             for line_number, raw_line in enumerate(stream, start=1):
@@ -59,7 +61,9 @@ def read_tum_trajectory_positions(input_path):
                             path,
                         )
                     )
+                timestamps.append(values[0])
                 positions.append(values[1:4])
+                quaternions.append(values[4:8])
     except (OSError, UnicodeError) as error:
         raise PcdError(
             "Could not read TUM trajectory {}: {}".format(path, error)
@@ -67,7 +71,17 @@ def read_tum_trajectory_positions(input_path):
 
     if not positions:
         raise PcdError("TUM trajectory contains no poses: {}".format(path))
-    return np.ascontiguousarray(positions, dtype=np.float64)
+    return (
+        np.ascontiguousarray(timestamps, dtype=np.float64),
+        np.ascontiguousarray(positions, dtype=np.float64),
+        np.ascontiguousarray(quaternions, dtype=np.float64),
+    )
+
+
+def read_tum_trajectory_positions(input_path):
+    """Read XYZ positions from a TUM trajectory file."""
+    _timestamps, positions, _quaternions = read_tum_trajectory_poses(input_path)
+    return positions
 
 
 def validate_pcd_file(input_path):

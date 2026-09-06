@@ -2,7 +2,7 @@
 <package format="2">
   <name>data_monitor</name>
   <version>0.1.0</version>
-  <description>Odometry and PCD bird's-eye-view monitoring tools.</description>
+  <description>Odometry, PCD bird's-eye-view and trajectory overlay monitoring tools.</description>
 
   <maintainer email="user@example.com">user</maintainer>
   <license>MIT</license>

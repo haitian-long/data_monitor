@@ -13,6 +13,7 @@ catkin_package()
 catkin_install_python(PROGRAMS
   src/odom_monitor/odom_monitor_node.py
   src/pcd_monitor/pcd_monitor_node.py
+  src/traj_monitor/traj_monitor_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

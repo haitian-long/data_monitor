@@ -1,0 +1,24 @@
+<launch>
+  <arg name="pcd_path" />
+  <arg name="voxel_size" default="0.30" />
+  <arg name="title" default="Trajectory BEV Monitor" />
+  <arg name="benchmark_trajectory_path" default="" />
+  <arg name="ours_trajectory_path" default="" />
+  <arg name="other_trajectory_paths" default="" />
+  <arg name="other_trajectory_names" default="" />
+
+  <node
+    pkg="data_monitor"
+    type="traj_monitor_node.py"
+    name="traj_monitor"
+    required="true"
+    output="screen">
+    <param name="pcd_path" value="$(arg pcd_path)" />
+    <param name="voxel_size" value="$(arg voxel_size)" />
+    <param name="title" value="$(arg title)" />
+    <param name="benchmark_trajectory_path" value="$(arg benchmark_trajectory_path)" />
+    <param name="ours_trajectory_path" value="$(arg ours_trajectory_path)" />
+    <param name="other_trajectory_paths" value="$(arg other_trajectory_paths)" />
+    <param name="other_trajectory_names" value="$(arg other_trajectory_names)" />
+  </node>
+</launch>

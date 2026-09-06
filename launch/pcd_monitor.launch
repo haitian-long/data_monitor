@@ -1,6 +1,6 @@
 <launch>
   <arg name="pcd_path" />
-  <arg name="voxel_size" default="0.10" />
+  <arg name="voxel_size" default="0.30" />
   <arg name="title" default="PCD BEV Monitor" />
   <arg name="colormap" default="turbo" />
   <arg name="trajectory_path" default="" />

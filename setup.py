@@ -6,7 +6,7 @@ from catkin_pkg.python_setup import generate_distutils_setup
 
 
 setup_args = generate_distutils_setup(
-    packages=["odom_monitor", "pcd_monitor"],
+    packages=["odom_monitor", "pcd_monitor", "traj_monitor"],
     package_dir={"": "src"},
 )
 
