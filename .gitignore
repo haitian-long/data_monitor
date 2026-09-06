@@ -1,2 +1,4 @@
 src/pcd_monitor/__pycache__
 src/traj_monitor/__pycache__/traj_monitor_node.cpython-38.pyc
+src/traj_monitor/__pycache__/__init__.cpython-38.pyc
+src/traj_monitor/__pycache__/toolbar_menus.cpython-38.pyc

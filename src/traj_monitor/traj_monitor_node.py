@@ -41,6 +41,13 @@ from pcd_monitor.pcd import (
     read_tum_trajectory_poses,
     validate_pcd_file,
 )
+from traj_monitor.toolbar_menus import (
+    attach_toolbar_dropdown,
+    create_dropdown_content,
+    create_dropdown_panel,
+    hide_dropdown,
+    raise_visible_dropdowns,
+)
 
 
 class TrajMonitor:
@@ -55,8 +62,6 @@ class TrajMonitor:
     INITIAL_FIGURE_SIZE = (12.8, 7.2)
     FIGURE_DPI = 100
     INTERACTION_RESTORE_DELAY_MS = 180
-    OVERLAY_TRAJECTORY_MAX_POINTS = 2500
-    OVERLAY_TRAJECTORY_DRAG_MAX_POINTS = 800
     MIN_VIEW_VOXELS = 8.0
     MAX_FULL_VIEW_SCALE = 4.0
     ZOOM_SLIDER_STEPS = 10000
@@ -72,7 +77,10 @@ class TrajMonitor:
     MAIN_TRAJECTORY_COLOR = "#DC2626"
     MAIN_TRAJECTORY_LINEWIDTH = 3.0
     OTHER_TRAJECTORY_LINEWIDTH = 2.2
-    ALIGN_HEADING_DISTANCE = 10.0
+    ALIGN_MOTION_START_M = 2.0
+    ALIGN_WINDOW_M = 20.0
+    ALIGN_MAX_TIME_DIFF = 0.05
+    ALIGN_MIN_PAIRS = 8
     LEGEND_TITLE_FONTSIZE = 16.0
     LEGEND_ITEM_FONTSIZE = 14.0
     LEGEND_HANDLELENGTH = 2.4
@@ -167,6 +175,7 @@ class TrajMonitor:
         self._log_bev_info("Initial BEV", self.bev)
 
         self._drag_state = None
+        self._overlay_view_limits = None
         self._interaction_active = False
         self._create_figure()
 
@@ -345,8 +354,6 @@ class TrajMonitor:
     def _on_scroll(self, event):
         if (
             event.inaxes is not self.axis
-            or event.xdata is None
-            or event.ydata is None
             or self._drag_state is not None
             or not self._toolbar_is_idle()
         ):
@@ -359,10 +366,13 @@ class TrajMonitor:
         else:
             return
 
-        x_min, x_max = self.axis.get_xlim()
-        y_min, y_max = self.axis.get_ylim()
-        relative_x = (event.xdata - x_min) / (x_max - x_min)
-        relative_y = (event.ydata - y_min) / (y_max - y_min)
+        data_xy = self._data_xy_from_event(event)
+        if data_xy is None:
+            return
+        data_x, data_y = data_xy
+        (x_min, x_max), (y_min, y_max) = self._current_view_limits()
+        relative_x = (data_x - x_min) / (x_max - x_min)
+        relative_y = (data_y - y_min) / (y_max - y_min)
         current_width = x_max - x_min
         current_height = y_max - y_min
         new_width = min(
@@ -373,19 +383,16 @@ class TrajMonitor:
             return
         applied_zoom_factor = new_width / current_width
         new_height = current_height * applied_zoom_factor
-
-        self._begin_interaction()
-        self.axis.set_xlim(
-            event.xdata - relative_x * new_width,
-            event.xdata + (1.0 - relative_x) * new_width,
+        self._apply_overlay_view(
+            (
+                data_x - relative_x * new_width,
+                data_x + (1.0 - relative_x) * new_width,
+            ),
+            (
+                data_y - relative_y * new_height,
+                data_y + (1.0 - relative_y) * new_height,
+            ),
         )
-        self.axis.set_ylim(
-            event.ydata - relative_y * new_height,
-            event.ydata + (1.0 - relative_y) * new_height,
-        )
-        self._sync_zoom_slider_to_current_view()
-        self._update_interaction_overlay()
-        self._schedule_interaction_finish()
 
     def _on_resize(self, _event):
         self._cancel_interaction()
@@ -393,9 +400,13 @@ class TrajMonitor:
         self.figure.canvas.draw_idle()
         self._update_interaction_overlay_geometry()
         self._interaction_overlay.raise_()
+        self._raise_toolbar_dropdowns()
         self._interaction_overlay.update()
 
     def _on_button_press(self, event):
+        if self._any_toolbar_menu_visible():
+            self._hide_toolbar_menus()
+            return
         if event.inaxes is not self.axis:
             return
         if event.dblclick and event.button == 1:
@@ -407,8 +418,7 @@ class TrajMonitor:
             and event.y is not None
             and self._toolbar_is_idle()
         ):
-            x_limits = self.axis.get_xlim()
-            y_limits = self.axis.get_ylim()
+            x_limits, y_limits = self._current_view_limits()
             self._drag_state = {
                 "start_pixel": (float(event.x), float(event.y)),
                 "x_limits": x_limits,
@@ -429,8 +439,7 @@ class TrajMonitor:
         ):
             return
 
-        x_limits, y_limits = self._drag_limits_for_event(event)
-        self._set_axis_limits(x_limits, y_limits)
+        self._overlay_view_limits = self._drag_limits_for_event(event)
         self._update_interaction_overlay()
 
     def _on_button_release(self, event):
@@ -438,9 +447,7 @@ class TrajMonitor:
             return
 
         if event.x is not None and event.y is not None:
-            x_limits, y_limits = self._drag_limits_for_event(event)
-            self._set_axis_limits(x_limits, y_limits)
-
+            self._overlay_view_limits = self._drag_limits_for_event(event)
         self._drag_state = None
         self._finish_interaction(force=True)
 
@@ -468,6 +475,63 @@ class TrajMonitor:
     def _set_axis_limits(self, x_limits, y_limits):
         self.axis.set_xlim(x_limits)
         self.axis.set_ylim(y_limits)
+
+    def _current_view_limits(self):
+        overlay = getattr(self, "_overlay_view_limits", None)
+        if overlay is not None:
+            return overlay
+        return (self.axis.get_xlim(), self.axis.get_ylim())
+
+    def _data_xy_from_event(self, event):
+        (x_min, x_max), (y_min, y_max) = self._current_view_limits()
+        data_rect = getattr(self, "_interaction_data_rect", None)
+        overlay = getattr(self, "_interaction_overlay", None)
+        if (
+            event.x is None
+            or event.y is None
+            or data_rect is None
+            or overlay is None
+            or data_rect.width() <= 0.0
+            or data_rect.height() <= 0.0
+        ):
+            if event.xdata is None or event.ydata is None:
+                return None
+            return float(event.xdata), float(event.ydata)
+
+        local_x = float(event.x) - float(overlay.x())
+        local_y = (
+            float(self.figure.canvas.height()) - float(event.y)
+        ) - float(overlay.y())
+        if not (
+            data_rect.left() <= local_x <= data_rect.right()
+            and data_rect.top() <= local_y <= data_rect.bottom()
+        ):
+            return None
+        data_x = x_min + (
+            (local_x - data_rect.left())
+            / data_rect.width()
+            * (x_max - x_min)
+        )
+        data_y = y_max - (
+            (local_y - data_rect.top())
+            / data_rect.height()
+            * (y_max - y_min)
+        )
+        return data_x, data_y
+
+    def _apply_overlay_view(self, x_limits, y_limits, sync_slider=True):
+        self._begin_interaction()
+        self._overlay_view_limits = (tuple(x_limits), tuple(y_limits))
+        if sync_slider:
+            self._sync_zoom_slider_to_current_view()
+        self._update_interaction_overlay()
+        self._schedule_interaction_finish()
+
+    def _commit_overlay_view(self):
+        if self._overlay_view_limits is None:
+            return
+        self._set_axis_limits(*self._overlay_view_limits)
+        self._overlay_view_limits = None
 
     def _set_plot_title(self):
         self.axis.set_title(
@@ -584,13 +648,6 @@ class TrajMonitor:
             getattr(alignment, "AlignRight")
             | getattr(alignment, "AlignVCenter")
         )
-        popup_mode = getattr(
-            QtWidgets.QToolButton,
-            "ToolButtonPopupMode",
-            QtWidgets.QToolButton,
-        )
-        instant_popup = getattr(popup_mode, "InstantPopup")
-
         window.removeToolBar(toolbar)
         window.addToolBar(top_tool_bar_area, toolbar)
         toolbar.clear()
@@ -608,13 +665,11 @@ class TrajMonitor:
         self._zoom_tool_button = QtWidgets.QToolButton(toolbar)
         self._zoom_tool_button.setObjectName("pcdMenuToolButton")
         self._zoom_tool_button.setText("Zoom")
-        self._zoom_tool_button.setPopupMode(instant_popup)
         self._zoom_tool_button.setToolTip(
             "Adjust the BEV zoom factor; the mouse wheel remains available"
         )
-        zoom_menu = QtWidgets.QMenu(self._zoom_tool_button)
-        zoom_menu.setObjectName("pcdMonitorMenu")
-        zoom_content = QtWidgets.QWidget(zoom_menu)
+        zoom_menu = create_dropdown_panel(window, QtCore, QtWidgets)
+        zoom_content = create_dropdown_content(zoom_menu, QtWidgets)
         zoom_content.setObjectName("pcdZoomContent")
         zoom_layout = QtWidgets.QHBoxLayout(zoom_content)
         zoom_layout.setContentsMargins(16, 10, 16, 10)
@@ -746,40 +801,42 @@ class TrajMonitor:
         zoom_layout.addWidget(self._qt_zoom_value_label)
         zoom_content.setMinimumWidth(560)
 
-        zoom_widget_action = QtWidgets.QWidgetAction(zoom_menu)
-        zoom_widget_action.setDefaultWidget(zoom_content)
-        zoom_menu.addAction(zoom_widget_action)
-        self._zoom_tool_button.setMenu(zoom_menu)
+        zoom_menu.layout().addWidget(zoom_content)
+        attach_toolbar_dropdown(
+            self._zoom_tool_button,
+            zoom_menu,
+            on_show=self._sync_zoom_slider_to_current_view,
+            on_hide=self._schedule_deferred_plot_chrome,
+            QtCore=QtCore,
+            sibling_panels=self._toolbar_menus,
+        )
         toolbar.addWidget(self._zoom_tool_button)
         self._qt_zoom_menu = zoom_menu
-        self._qt_zoom_widget_action = zoom_widget_action
 
         self._resolution_tool_button = QtWidgets.QToolButton(toolbar)
         self._resolution_tool_button.setObjectName("pcdMenuToolButton")
         self._resolution_tool_button.setText("Resolution")
-        self._resolution_tool_button.setPopupMode(instant_popup)
         self._resolution_tool_button.setToolTip(
             "Select the resolution used by the next BEV rebuild"
         )
-        resolution_menu = QtWidgets.QMenu(self._resolution_tool_button)
-        resolution_menu.setObjectName("pcdMonitorMenu")
-        action_group_class = (
-            getattr(QtGui, "QActionGroup", None)
-            or getattr(QtWidgets, "QActionGroup")
-        )
-        self._resolution_action_group = action_group_class(resolution_menu)
-        self._resolution_action_group.setExclusive(True)
+        resolution_menu = create_dropdown_panel(window, QtCore, QtWidgets)
+        resolution_content = create_dropdown_content(resolution_menu, QtWidgets)
+        resolution_content.setObjectName("pcdResolutionContent")
+        resolution_layout = QtWidgets.QVBoxLayout(resolution_content)
+        resolution_layout.setContentsMargins(8, 6, 8, 6)
+        resolution_layout.setSpacing(2)
         self._resolution_actions = {}
         for width, height in self.BEV_RESOLUTIONS:
-            action = resolution_menu.addAction(
-                "{} × {}".format(width, height)
-            )
-            action.setCheckable(True)
-            action.setChecked(
+            choice = QtWidgets.QToolButton(resolution_content)
+            choice.setObjectName("pcdResolutionChoice")
+            choice.setText("{} × {}".format(width, height))
+            choice.setCheckable(True)
+            choice.setAutoExclusive(True)
+            choice.setChecked(
                 width == self.selected_bev_width
                 and height == self.selected_bev_height
             )
-            action.triggered.connect(
+            choice.clicked.connect(
                 lambda _checked=False,
                 selected_width=width,
                 selected_height=height:
@@ -788,11 +845,124 @@ class TrajMonitor:
                     selected_height,
                 )
             )
-            self._resolution_action_group.addAction(action)
-            self._resolution_actions[(width, height)] = action
-        self._resolution_tool_button.setMenu(resolution_menu)
+            resolution_layout.addWidget(choice)
+            self._resolution_actions[(width, height)] = choice
+        resolution_menu.layout().addWidget(resolution_content)
+        attach_toolbar_dropdown(
+            self._resolution_tool_button,
+            resolution_menu,
+            QtCore=QtCore,
+            sibling_panels=self._toolbar_menus,
+        )
         toolbar.addWidget(self._resolution_tool_button)
         self._qt_resolution_menu = resolution_menu
+
+        self._filter_tool_button = QtWidgets.QToolButton(toolbar)
+        self._filter_tool_button.setObjectName("pcdMenuToolButton")
+        self._filter_tool_button.setText("Filter")
+        self._filter_tool_button.setToolTip(
+            "Show or hide trajectories in the plot and legend"
+        )
+        filter_menu = create_dropdown_panel(window, QtCore, QtWidgets)
+        filter_content = create_dropdown_content(filter_menu, QtWidgets)
+        filter_content.setObjectName("pcdFilterContent")
+        filter_layout = QtWidgets.QVBoxLayout(filter_content)
+        filter_layout.setContentsMargins(12, 8, 16, 8)
+        filter_layout.setSpacing(4)
+        self._filter_checkboxes = []
+        if self.trajectories:
+            for traj in self.trajectories:
+                checkbox = QtWidgets.QCheckBox(traj["label"], filter_content)
+                checkbox.setObjectName("pcdFilterCheckBox")
+                checkbox.setChecked(bool(traj.get("visible", True)))
+                checkbox.toggled.connect(
+                    lambda checked, target=traj: self._set_trajectory_visible(
+                        target,
+                        bool(checked),
+                    )
+                )
+                filter_layout.addWidget(checkbox)
+                self._filter_checkboxes.append(checkbox)
+        else:
+            empty_label = QtWidgets.QLabel("No trajectories", filter_content)
+            filter_layout.addWidget(empty_label)
+        filter_menu.layout().addWidget(filter_content)
+        attach_toolbar_dropdown(
+            self._filter_tool_button,
+            filter_menu,
+            on_hide=self._schedule_deferred_plot_chrome,
+            QtCore=QtCore,
+            sibling_panels=self._toolbar_menus,
+        )
+        toolbar.addWidget(self._filter_tool_button)
+        self._qt_filter_menu = filter_menu
+
+        self._color_tool_button = QtWidgets.QToolButton(toolbar)
+        self._color_tool_button.setObjectName("pcdMenuToolButton")
+        self._color_tool_button.setText("Color")
+        self._color_tool_button.setToolTip(
+            "Edit trajectory colors by hex value or color picker"
+        )
+        color_menu = create_dropdown_panel(window, QtCore, QtWidgets)
+        color_content = create_dropdown_content(color_menu, QtWidgets)
+        color_content.setObjectName("pcdColorContent")
+        color_layout = QtWidgets.QVBoxLayout(color_content)
+        color_layout.setContentsMargins(12, 8, 16, 8)
+        color_layout.setSpacing(6)
+        self._color_editors = []
+        self._color_pick_target = None
+        if self.trajectories:
+            for traj in self.trajectories:
+                row = QtWidgets.QWidget(color_content)
+                row_layout = QtWidgets.QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+                name_label = QtWidgets.QLabel(traj["label"], row)
+                name_label.setObjectName("pcdColorName")
+                name_label.setMinimumWidth(88)
+                color_edit = QtWidgets.QLineEdit(traj["color"], row)
+                color_edit.setObjectName("pcdColorEdit")
+                color_edit.setFixedWidth(86)
+                swatch = QtWidgets.QToolButton(row)
+                swatch.setObjectName("pcdColorSwatch")
+                swatch.setFixedSize(22, 22)
+                swatch.setToolTip("Choose this trajectory, then pick a color below")
+                self._style_color_swatch(swatch, traj["color"])
+                color_edit.editingFinished.connect(
+                    lambda editor=color_edit, target=traj, button=swatch:
+                    self._set_trajectory_color(
+                        target,
+                        editor.text(),
+                        editor,
+                        button,
+                    )
+                )
+                swatch.clicked.connect(
+                    lambda _checked=False, target=traj, editor=color_edit, button=swatch:
+                    self._select_color_target(target, editor, button)
+                )
+                row_layout.addWidget(name_label)
+                row_layout.addWidget(color_edit)
+                row_layout.addWidget(swatch)
+                color_layout.addWidget(row)
+                self._color_editors.append((traj, color_edit, swatch))
+            first_traj, first_edit, first_swatch = self._color_editors[0]
+            self._select_color_target(first_traj, first_edit, first_swatch)
+            palette = self._build_inline_color_palette(color_content)
+            color_layout.addWidget(palette)
+        else:
+            empty_label = QtWidgets.QLabel("No trajectories", color_content)
+            color_layout.addWidget(empty_label)
+        color_menu.layout().addWidget(color_content)
+        attach_toolbar_dropdown(
+            self._color_tool_button,
+            color_menu,
+            on_hide=self._schedule_deferred_plot_chrome,
+            QtCore=QtCore,
+            sibling_panels=self._toolbar_menus,
+        )
+        toolbar.addWidget(self._color_tool_button)
+        self._qt_color_menu = color_menu
 
         toolbar.addSeparator()
         self._save_action = toolbar.addAction("Save PNG")
@@ -883,8 +1053,44 @@ class TrajMonitor:
                 color: #4338ca;
                 background: #eef2ff;
             }
-            QWidget#pcdZoomContent {
+            QWidget#pcdZoomContent,
+            QWidget#pcdFilterContent,
+            QWidget#pcdColorContent {
                 background: #ffffff;
+            }
+            QFrame#pcdColorPanel {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            QLabel#pcdColorName {
+                color: #334155;
+                font-weight: 600;
+            }
+            QLineEdit#pcdColorEdit {
+                color: #334155;
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 3px 6px;
+                font-family: monospace;
+            }
+            QToolButton#pcdColorSwatch {
+                border: 1px solid #94a3b8;
+                border-radius: 5px;
+                padding: 0px;
+            }
+            QToolButton#pcdColorSwatch:hover {
+                border: 1px solid #4338ca;
+            }
+            QCheckBox#pcdFilterCheckBox {
+                color: #334155;
+                spacing: 8px;
+                padding: 3px 4px;
+                font-weight: 600;
+            }
+            QCheckBox#pcdFilterCheckBox:hover {
+                color: #4338ca;
             }
             QLabel#pcdZoomBoundLabel {
                 color: #64748b;
@@ -939,14 +1145,90 @@ class TrajMonitor:
         self._qt_zoom_slider.sliderReleased.connect(
             self._zoom_slider_released
         )
-        zoom_menu.aboutToShow.connect(
-            self._sync_zoom_slider_to_current_view
-        )
 
+        self._install_window_escape_closes_menus(window, QtCore, QtWidgets)
         rospy.loginfo(
             "Installed native Qt toolbar: Reset | Zoom | Resolution | "
-            "Save PNG | Save TIFF | Rebuild"
+            "Filter | Color | Save PNG | Save TIFF | Rebuild"
         )
+
+    def _install_window_escape_closes_menus(self, window, QtCore, QtWidgets):
+        from matplotlib.backends.qt_compat import QtGui
+        from traj_monitor.toolbar_menus import _escape_key
+
+        escape = _escape_key(QtCore)
+        key_sequence = getattr(QtGui, "QKeySequence", None) or getattr(
+            QtWidgets,
+            "QKeySequence",
+            None,
+        )
+        shortcut_cls = getattr(QtWidgets, "QShortcut", None)
+        if escape is None or key_sequence is None or shortcut_cls is None:
+            return
+        shortcut = shortcut_cls(key_sequence(escape), window)
+        context = getattr(
+            getattr(QtCore.Qt, "ShortcutContext", QtCore.Qt),
+            "ApplicationShortcut",
+            getattr(QtCore.Qt, "ApplicationShortcut", None),
+        )
+        if context is not None:
+            shortcut.setContext(context)
+        shortcut.activated.connect(self._hide_toolbar_menus)
+        self._escape_menu_shortcut = shortcut
+
+    def _hide_toolbar_menus(self):
+        hidden = False
+        for menu in self._toolbar_menus():
+            if hide_dropdown(menu):
+                hidden = True
+        return hidden
+
+    def _raise_toolbar_dropdowns(self):
+        raise_visible_dropdowns(self._toolbar_menus())
+
+    def _toolbar_menus(self):
+        return (
+            getattr(self, "_qt_zoom_menu", None),
+            getattr(self, "_qt_filter_menu", None),
+            getattr(self, "_qt_color_menu", None),
+            getattr(self, "_qt_resolution_menu", None),
+        )
+
+    def _any_toolbar_menu_visible(self):
+        return any(
+            menu is not None and menu.isVisible()
+            for menu in self._toolbar_menus()
+        )
+
+    def _request_plot_chrome_refresh(self):
+        self._plot_chrome_refresh_pending = True
+        if hasattr(self, "_interaction_overlay"):
+            self._interaction_overlay.update()
+        if self._any_toolbar_menu_visible():
+            return
+        self._schedule_deferred_plot_chrome()
+
+    def _schedule_deferred_plot_chrome(self):
+        from matplotlib.backends.qt_compat import QtCore
+
+        if not getattr(self, "_plot_chrome_refresh_pending", False):
+            return
+        timer = getattr(self, "_plot_chrome_flush_timer", None)
+        if timer is None:
+            timer = QtCore.QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._flush_deferred_plot_chrome)
+            self._plot_chrome_flush_timer = timer
+        timer.start(0)
+
+    def _flush_deferred_plot_chrome(self):
+        if not getattr(self, "_plot_chrome_refresh_pending", False):
+            return
+        if self._any_toolbar_menu_visible():
+            return
+        self._plot_chrome_refresh_pending = False
+        if hasattr(self, "_interaction_overlay"):
+            self._interaction_overlay.update()
 
     def _layout_figure(self):
         figure_height = max(float(self.figure.bbox.height), 1.0)
@@ -1104,12 +1386,18 @@ class TrajMonitor:
             False,
         )
         self._draw_cached_bev_image(painter, data_rect)
-
+        (view_min_x, view_max_x), (view_min_y, view_max_y) = (
+            self._current_view_limits()
+        )
         x_ticks, x_labels, x_offset = self._interaction_axis_ticks(
-            self.axis.xaxis
+            self.axis.xaxis,
+            view_min_x,
+            view_max_x,
         )
         y_ticks, y_labels, y_offset = self._interaction_axis_ticks(
-            self.axis.yaxis
+            self.axis.yaxis,
+            view_min_y,
+            view_max_y,
         )
         self._draw_interaction_grid(
             painter,
@@ -1119,7 +1407,8 @@ class TrajMonitor:
         )
         self._draw_interaction_trajectories(painter, data_rect)
         self._draw_interaction_start_marker(painter, data_rect)
-        self._draw_interaction_legend(painter, data_rect)
+        if not self._interaction_active:
+            self._draw_interaction_legend(painter, data_rect)
         self._draw_interaction_axes(
             painter,
             data_rect,
@@ -1136,8 +1425,9 @@ class TrajMonitor:
         image_min_x, image_max_x, image_min_y, image_max_y = self.bev[
             "extent"
         ]
-        view_min_x, view_max_x = self.axis.get_xlim()
-        view_min_y, view_max_y = self.axis.get_ylim()
+        (view_min_x, view_max_x), (view_min_y, view_max_y) = (
+            self._current_view_limits()
+        )
         visible_min_x = max(image_min_x, view_min_x)
         visible_max_x = min(image_max_x, view_max_x)
         visible_min_y = max(image_min_y, view_min_y)
@@ -1206,18 +1496,34 @@ class TrajMonitor:
         bev["qt_pixmap"] = pixmap
         return pixmap
 
-    def _interaction_axis_ticks(self, matplotlib_axis):
-        locations = np.asarray(
-            matplotlib_axis.get_majorticklocs(),
-            dtype=np.float64,
-        )
+    def _interaction_axis_ticks(self, matplotlib_axis, vmin=None, vmax=None):
+        if vmin is None or vmax is None:
+            locations = np.asarray(
+                matplotlib_axis.get_majorticklocs(),
+                dtype=np.float64,
+            )
+        else:
+            locator = matplotlib_axis.get_major_locator()
+            try:
+                locations = np.asarray(
+                    locator.tick_values(float(vmin), float(vmax)),
+                    dtype=np.float64,
+                )
+            except (AttributeError, TypeError, ValueError):
+                locations = np.asarray(
+                    matplotlib_axis.get_majorticklocs(),
+                    dtype=np.float64,
+                )
         formatter = matplotlib_axis.get_major_formatter()
         formatter.set_locs(locations)
         labels = [
             formatter(float(location), index)
             for index, location in enumerate(locations)
         ]
-        return locations, labels, formatter.get_offset()
+        offset = ""
+        if callable(getattr(formatter, "get_offset", None)):
+            offset = formatter.get_offset()
+        return locations, labels, offset
 
     def _draw_interaction_grid(
         self,
@@ -1226,8 +1532,9 @@ class TrajMonitor:
         x_ticks,
         y_ticks,
     ):
-        view_min_x, view_max_x = self.axis.get_xlim()
-        view_min_y, view_max_y = self.axis.get_ylim()
+        (view_min_x, view_max_x), (view_min_y, view_max_y) = (
+            self._current_view_limits()
+        )
         grid_color = self._qt_gui.QColor(self.GRID_COLOR)
         grid_color.setAlphaF(0.45)
         grid_pen = self._qt_gui.QPen(grid_color)
@@ -1265,16 +1572,6 @@ class TrajMonitor:
                 )
         painter.restore()
 
-    def _decimate_positions(self, positions, max_points):
-        if positions is None or positions.shape[0] <= max_points:
-            return positions
-        stride = max(1, int(math.ceil(positions.shape[0] / float(max_points))))
-        sampled = positions[::stride]
-        last = positions[-1]
-        if sampled[-1, 0] != last[0] or sampled[-1, 1] != last[1]:
-            sampled = np.vstack((sampled, last[None, :]))
-        return sampled
-
     def _positions_to_qpath(self, positions):
         path = self._qt_gui.QPainterPath()
         path_started = False
@@ -1290,33 +1587,18 @@ class TrajMonitor:
         return path
 
     def _build_trajectory_qitems(self):
-        items = []
-        for traj in self._draw_order_trajectories():
-            items.append(
-                (
-                    self._positions_to_qpath(
-                        self._decimate_positions(
-                            traj["positions"],
-                            self.OVERLAY_TRAJECTORY_MAX_POINTS,
-                        )
-                    ),
-                    self._positions_to_qpath(
-                        self._decimate_positions(
-                            traj["positions"],
-                            self.OVERLAY_TRAJECTORY_DRAG_MAX_POINTS,
-                        )
-                    ),
-                    traj,
-                )
-            )
-        return items
+        return [
+            (self._positions_to_qpath(traj["positions"]), traj)
+            for traj in self._draw_order_trajectories()
+        ]
 
     def _draw_interaction_trajectories(self, painter, data_rect):
         if not self._trajectory_qitems:
             return
 
-        view_min_x, view_max_x = self.axis.get_xlim()
-        view_min_y, view_max_y = self.axis.get_ylim()
+        (view_min_x, view_max_x), (view_min_y, view_max_y) = (
+            self._current_view_limits()
+        )
         scale_x = data_rect.width() / (view_max_x - view_min_x)
         scale_y = data_rect.height() / (view_max_y - view_min_y)
         transform = self._qt_gui.QTransform(
@@ -1335,19 +1617,10 @@ class TrajMonitor:
         interacting = bool(self._interaction_active or self._drag_state)
         painter.save()
         painter.setClipRect(data_rect)
-        painter.setRenderHint(
-            getattr(
-                getattr(
-                    self._qt_gui.QPainter,
-                    "RenderHint",
-                    self._qt_gui.QPainter,
-                ),
-                "Antialiasing",
-            ),
-            not interacting,
-        )
         painter.setTransform(transform, True)
-        for full_path, drag_path, traj in self._trajectory_qitems:
+        for qpath, traj in self._trajectory_qitems:
+            if not traj.get("visible", True):
+                continue
             trajectory_pen = self._qt_gui.QPen(
                 self._qt_gui.QColor(traj["color"])
             )
@@ -1358,7 +1631,7 @@ class TrajMonitor:
             else:
                 trajectory_pen.setStyle(getattr(pen_styles, "DashLine"))
             painter.setPen(trajectory_pen)
-            painter.drawPath(drag_path if interacting else full_path)
+            painter.drawPath(qpath)
         painter.restore()
 
     def _triangle_path(self, center, radius):
@@ -1385,8 +1658,9 @@ class TrajMonitor:
     def _draw_interaction_start_marker(self, painter, data_rect):
         if self.start_xy is None:
             return
-        view_min_x, view_max_x = self.axis.get_xlim()
-        view_min_y, view_max_y = self.axis.get_ylim()
+        (view_min_x, view_max_x), (view_min_y, view_max_y) = (
+            self._current_view_limits()
+        )
         start_x, start_y = self.start_xy
         if not (
             view_min_x <= start_x <= view_max_x
@@ -1430,7 +1704,8 @@ class TrajMonitor:
         painter.restore()
 
     def _draw_interaction_legend(self, painter, data_rect):
-        if not self.trajectories:
+        visible = self._visible_trajectories()
+        if not visible and self.start_xy is None:
             return
 
         scale = self._ui_scale()
@@ -1443,7 +1718,7 @@ class TrajMonitor:
         line_len = 22.0 * scale
         row_height = max(float(metrics.height()) * 1.12, 14.0 * scale)
         text_width = 0.0
-        legend_labels = [traj["label"] for traj in self.trajectories]
+        legend_labels = [traj["label"] for traj in visible]
         if self.start_xy is not None:
             legend_labels.append(self.START_MARKER_LABEL)
         for label in legend_labels:
@@ -1505,7 +1780,7 @@ class TrajMonitor:
 
         painter.setFont(font)
         y = box.top() + pad
-        for traj in self.trajectories:
+        for traj in visible:
             center_y = y + row_height / 2.0
             line_left = box.left() + pad
             line_right = line_left + line_len
@@ -1598,8 +1873,9 @@ class TrajMonitor:
         painter.setPen(self._qt_gui.QColor(self.UI_MUTED_TEXT))
         tick_metrics = self._qt_gui.QFontMetricsF(tick_font)
         tick_length = 4.0
-        view_min_x, view_max_x = self.axis.get_xlim()
-        view_min_y, view_max_y = self.axis.get_ylim()
+        (view_min_x, view_max_x), (view_min_y, view_max_y) = (
+            self._current_view_limits()
+        )
 
         for value, label in zip(x_ticks, x_labels):
             if not view_min_x <= value <= view_max_x:
@@ -1765,6 +2041,7 @@ class TrajMonitor:
         self._update_interaction_overlay_geometry()
         self._interaction_overlay.show()
         self._interaction_overlay.raise_()
+        self._raise_toolbar_dropdowns()
         self._interaction_overlay.update()
 
     def _update_interaction_overlay(self):
@@ -1787,12 +2064,14 @@ class TrajMonitor:
             return False
 
         self._interaction_restore_timer.stop()
+        self._commit_overlay_view()
         self._interaction_active = False
         if draw:
             # Synchronize Matplotlib behind the persistent Qt plot layer.
             # The screen never switches renderers when interaction ends.
             self._raw_canvas_draw()
         self._interaction_overlay.raise_()
+        self._raise_toolbar_dropdowns()
         self._interaction_overlay.update()
         return True
 
@@ -1800,8 +2079,10 @@ class TrajMonitor:
         if hasattr(self, "_interaction_restore_timer"):
             self._interaction_restore_timer.stop()
         self._interaction_active = False
+        self._overlay_view_limits = None
         if hasattr(self, "_interaction_overlay"):
             self._interaction_overlay.raise_()
+            self._raise_toolbar_dropdowns()
             self._interaction_overlay.update()
 
     def _select_bev_resolution(self, width, height):
@@ -1809,6 +2090,7 @@ class TrajMonitor:
         self.selected_bev_height = height
         for resolution, action in self._resolution_actions.items():
             action.setChecked(resolution == (width, height))
+        hide_dropdown(getattr(self, "_qt_resolution_menu", None))
         rospy.loginfo(
             "Selected BEV rebuild resolution: %d x %d; "
             "click Rebuild BEV to apply",
@@ -1820,8 +2102,7 @@ class TrajMonitor:
         self._finish_interaction(force=True)
 
     def _adjust_zoom_factor(self, delta):
-        x_min, x_max = self.axis.get_xlim()
-        y_min, y_max = self.axis.get_ylim()
+        (x_min, x_max), (y_min, y_max) = self._current_view_limits()
         current_width = abs(x_max - x_min)
         current_zoom = self.full_view_width / current_width
         # Start from the same two-decimal value shown beside the slider so
@@ -1840,8 +2121,7 @@ class TrajMonitor:
         center_x = (x_min + x_max) / 2.0
         center_y = (y_min + y_max) / 2.0
         new_height = new_width / self.BEV_ASPECT_RATIO
-        self._begin_interaction()
-        self._set_axis_limits(
+        self._apply_overlay_view(
             (
                 center_x - new_width / 2.0,
                 center_x + new_width / 2.0,
@@ -1851,9 +2131,6 @@ class TrajMonitor:
                 center_y + new_height / 2.0,
             ),
         )
-        self._sync_zoom_slider_to_current_view()
-        self._update_interaction_overlay()
-        self._schedule_interaction_finish()
 
     def _view_width_to_slider_value(self, view_width):
         bounded_width = min(
@@ -1880,15 +2157,12 @@ class TrajMonitor:
             float(slider_position) / float(self.ZOOM_SLIDER_STEPS)
         )
 
-        x_min, x_max = self.axis.get_xlim()
-        y_min, y_max = self.axis.get_ylim()
+        (x_min, x_max), (y_min, y_max) = self._current_view_limits()
         center_x = (x_min + x_max) / 2.0
         center_y = (y_min + y_max) / 2.0
         new_width = self._slider_value_to_view_width(slider_value)
         new_height = new_width / self.BEV_ASPECT_RATIO
-
-        self._begin_interaction()
-        self._set_axis_limits(
+        self._apply_overlay_view(
             (
                 center_x - new_width / 2.0,
                 center_x + new_width / 2.0,
@@ -1897,16 +2171,15 @@ class TrajMonitor:
                 center_y - new_height / 2.0,
                 center_y + new_height / 2.0,
             ),
+            sync_slider=False,
         )
         self._set_zoom_slider_value_text(new_width)
-        self._update_interaction_overlay()
-        self._schedule_interaction_finish()
 
     def _sync_zoom_slider_to_current_view(self):
         if not hasattr(self, "_qt_zoom_slider"):
             return
 
-        x_min, x_max = self.axis.get_xlim()
+        (x_min, x_max), _y_limits = self._current_view_limits()
         view_width = abs(x_max - x_min)
         slider_value = self._view_width_to_slider_value(view_width)
         slider_position = int(
@@ -1927,6 +2200,9 @@ class TrajMonitor:
         )
 
     def _on_key_press(self, event):
+        if event.key and event.key.lower() == "escape":
+            self._hide_toolbar_menus()
+            return
         if event.key and event.key.lower() == "r":
             self._restore_full_bev()
 
@@ -2043,6 +2319,132 @@ class TrajMonitor:
 
     def _is_ours_loaded(self, traj):
         return bool(traj.get("is_ours"))
+
+    def _visible_trajectories(self):
+        return [
+            traj for traj in self.trajectories if traj.get("visible", True)
+        ]
+
+    def _set_trajectory_visible(self, traj, visible):
+        traj["visible"] = bool(visible)
+        line = traj.get("mpl_line")
+        if line is not None:
+            line.set_visible(traj["visible"])
+        self._request_plot_chrome_refresh()
+
+    @staticmethod
+    def _normalize_color_text(text):
+        from matplotlib.backends.qt_compat import QtGui
+
+        value = str(text).strip()
+        if not value:
+            return None
+        if not value.startswith("#"):
+            value = "#" + value
+        color = QtGui.QColor(value)
+        if not color.isValid():
+            return None
+        return color.name()
+
+    def _style_color_swatch(self, button, color_text, selected=False):
+        border = "#4338ca" if selected else "#94a3b8"
+        button.setStyleSheet(
+            "QToolButton#pcdColorSwatch {{"
+            "background: {0};"
+            "border: {1} solid {2};"
+            "border-radius: 5px;"
+            "padding: 0px;"
+            "}}"
+            "QToolButton#pcdColorSwatch:hover {{"
+            "border: 2px solid #4338ca;"
+            "}}".format(color_text, "2px" if selected else "1px", border)
+        )
+
+    def _set_trajectory_color(self, traj, color_text, editor=None, swatch=None):
+        parsed = self._normalize_color_text(color_text)
+        if parsed is None:
+            if editor is not None:
+                editor.setText(traj["color"])
+            return
+        if parsed == traj["color"]:
+            if editor is not None:
+                editor.setText(parsed)
+            return
+        traj["color"] = parsed
+        if editor is not None:
+            editor.setText(parsed)
+        if swatch is not None:
+            self._style_color_swatch(swatch, parsed)
+        line = traj.get("mpl_line")
+        if line is not None:
+            line.set_color(parsed)
+        self._request_plot_chrome_refresh()
+
+    def _select_color_target(self, traj, editor, swatch):
+        self._color_pick_target = (traj, editor, swatch)
+        for _traj, _editor, button in getattr(self, "_color_editors", []):
+            self._style_color_swatch(
+                button,
+                _traj["color"],
+                selected=button is swatch,
+            )
+
+    def _build_inline_color_palette(self, parent):
+        from matplotlib.backends.qt_compat import QtWidgets
+
+        palette = QtWidgets.QWidget(parent)
+        palette.setObjectName("pcdColorPalette")
+        grid = QtWidgets.QGridLayout(palette)
+        grid.setContentsMargins(0, 6, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(4)
+        colors = (
+            "#DC2626",
+            "#EA580C",
+            "#CA8A04",
+            "#16A34A",
+            "#0891B2",
+            "#1D4ED8",
+            "#6D28D9",
+            "#9A3412",
+            "#EF4444",
+            "#F97316",
+            "#EAB308",
+            "#22C55E",
+            "#06B6D4",
+            "#3B82F6",
+            "#8B5CF6",
+            "#0F172A",
+            "#FCA5A5",
+            "#FDBA74",
+            "#FDE047",
+            "#86EFAC",
+            "#67E8F9",
+            "#93C5FD",
+            "#C4B5FD",
+            "#64748B",
+        )
+        columns = 8
+        for index, color_text in enumerate(colors):
+            cell = QtWidgets.QToolButton(palette)
+            cell.setObjectName("pcdColorSwatch")
+            cell.setFixedSize(20, 20)
+            cell.setToolTip(color_text)
+            self._style_color_swatch(cell, color_text)
+            cell.clicked.connect(
+                lambda _checked=False, value=color_text:
+                self._apply_palette_color(value)
+            )
+            grid.addWidget(cell, index // columns, index % columns)
+        return palette
+
+    def _apply_palette_color(self, color_text):
+        target = getattr(self, "_color_pick_target", None)
+        if target is None:
+            return
+        traj, editor, swatch = target
+        self._set_trajectory_color(traj, color_text, editor, swatch)
+        self._style_color_swatch(swatch, color_text, selected=True)
 
     def _order_trajectories(self, trajectories):
         mains = [traj for traj in trajectories if traj["is_main"]]
@@ -2171,6 +2573,7 @@ class TrajMonitor:
             "linewidth": linewidth,
             "is_main": is_main,
             "is_ours": is_ours,
+            "visible": True,
         }
 
     @staticmethod
@@ -2181,21 +2584,56 @@ class TrajMonitor:
         return 0
 
     @staticmethod
-    def _travel_heading(positions, start_index, distance):
-        origin = positions[start_index, :2]
-        for index in range(start_index + 1, positions.shape[0]):
-            delta = positions[index, :2] - origin
-            if float(np.linalg.norm(delta)) >= distance:
-                return math.atan2(float(delta[1]), float(delta[0]))
+    def _valid_pose_slice(timestamps, positions):
+        start_index = TrajMonitor._start_pose_index(timestamps)
+        return timestamps[start_index:], positions[start_index:]
 
-        relative = positions[start_index:, :2] - origin
-        if relative.shape[0] == 0:
-            return 0.0
-        farthest = int(np.argmax(np.linalg.norm(relative, axis=1)))
-        delta = relative[farthest]
-        if float(np.linalg.norm(delta)) < 1e-6:
-            return 0.0
-        return math.atan2(float(delta[1]), float(delta[0]))
+    @staticmethod
+    def _associate_xyz(t_ref, xyz_ref, t_est, xyz_est, max_diff):
+        if t_ref.size == 0 or t_est.size == 0:
+            empty = xyz_ref[:0]
+            return empty, empty
+        idx = np.searchsorted(t_ref, t_est)
+        idx = np.clip(idx, 0, len(t_ref) - 1)
+        idx_lo = np.clip(idx - 1, 0, len(t_ref) - 1)
+        use_lo = np.abs(t_ref[idx_lo] - t_est) <= np.abs(t_ref[idx] - t_est)
+        best = np.where(use_lo, idx_lo, idx)
+        ok = np.abs(t_ref[best] - t_est) <= max_diff
+        return xyz_ref[best[ok]], xyz_est[ok]
+
+    @staticmethod
+    def _motion_window(xyz, start_m, window_m, min_pts):
+        if len(xyz) < 3:
+            return 0, len(xyz)
+        disp = np.linalg.norm(xyz - xyz[0], axis=1)
+        moved = np.where(disp >= start_m)[0]
+        i0 = int(moved[0]) if moved.size else 0
+        step = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+        slen = np.concatenate([[0.0], np.cumsum(step)])
+        i1 = int(np.searchsorted(slen, slen[i0] + window_m))
+        i1 = min(max(i1, i0 + min_pts), len(xyz))
+        if i1 - i0 < 3:
+            return 0, min(len(xyz), max(min_pts, 3))
+        return i0, i1
+
+    @staticmethod
+    def _umeyama_se3(src, dst):
+        """Least-squares SE(3): dst ~= R @ src + t. src/dst are Nx3."""
+        if src.shape[0] < 3 or src.shape != dst.shape:
+            raise ValueError("need at least 3 corresponding 3D points")
+        n = src.shape[0]
+        mean_src = src.mean(axis=0)
+        mean_dst = dst.mean(axis=0)
+        cov = ((dst - mean_dst).T @ (src - mean_src)) / float(n)
+        u, singular, vt = np.linalg.svd(cov)
+        if np.count_nonzero(singular > np.finfo(singular.dtype).eps) < 2:
+            raise ValueError("degenerate Umeyama covariance")
+        correction = np.eye(3)
+        if np.linalg.det(u) * np.linalg.det(vt) < 0.0:
+            correction[2, 2] = -1.0
+        rotation = u @ correction @ vt
+        translation = mean_dst - rotation @ mean_src
+        return rotation, translation
 
     def _align_other_trajectories(self, trajectories):
         mains = [traj for traj in trajectories if traj["is_main"]]
@@ -2203,59 +2641,64 @@ class TrajMonitor:
             return trajectories
 
         main = mains[0]
-        main_index = self._start_pose_index(main["timestamps"])
-        ref_position = main["positions"][main_index]
-        ref_yaw = self._travel_heading(
-            main["positions"],
-            main_index,
-            self.ALIGN_HEADING_DISTANCE,
+        t_ref, xyz_ref = self._valid_pose_slice(
+            main["timestamps"], main["positions"]
         )
         rospy.loginfo(
-            "Aligning other trajectories to %s start pose: "
-            "xy=[%.4f, %.4f] m, travel yaw=%.3f deg (first %.1f m)",
+            "Aligning other trajectories to %s with 3D Umeyama "
+            "on the first %.1f m after moving %.1f m",
             main["label"],
-            float(ref_position[0]),
-            float(ref_position[1]),
-            math.degrees(ref_yaw),
-            self.ALIGN_HEADING_DISTANCE,
+            self.ALIGN_WINDOW_M,
+            self.ALIGN_MOTION_START_M,
         )
 
         for traj in trajectories:
             if traj["is_main"]:
                 continue
-            start_index = self._start_pose_index(traj["timestamps"])
-            src_position = traj["positions"][start_index]
-            src_yaw = self._travel_heading(
-                traj["positions"],
-                start_index,
-                self.ALIGN_HEADING_DISTANCE,
+            t_est, xyz_est = self._valid_pose_slice(
+                traj["timestamps"], traj["positions"]
             )
-            delta_yaw = ref_yaw - src_yaw
-            cos_yaw = math.cos(delta_yaw)
-            sin_yaw = math.sin(delta_yaw)
-            relative_xy = traj["positions"][:, :2] - src_position[:2]
-            aligned = np.empty_like(traj["positions"])
-            aligned[:, 0] = (
-                cos_yaw * relative_xy[:, 0]
-                - sin_yaw * relative_xy[:, 1]
-                + ref_position[0]
+            ref_pts, est_pts = self._associate_xyz(
+                t_ref,
+                xyz_ref,
+                t_est,
+                xyz_est,
+                self.ALIGN_MAX_TIME_DIFF,
             )
-            aligned[:, 1] = (
-                sin_yaw * relative_xy[:, 0]
-                + cos_yaw * relative_xy[:, 1]
-                + ref_position[1]
+            if len(ref_pts) < self.ALIGN_MIN_PAIRS:
+                rospy.logwarn(
+                    "Skip Umeyama for %s: only %d time-matched poses",
+                    traj["label"],
+                    len(ref_pts),
+                )
+                continue
+            i0, i1 = self._motion_window(
+                ref_pts,
+                self.ALIGN_MOTION_START_M,
+                self.ALIGN_WINDOW_M,
+                self.ALIGN_MIN_PAIRS,
             )
-            aligned[:, 2] = (
-                traj["positions"][:, 2] - src_position[2] + ref_position[2]
+            try:
+                rotation, translation = self._umeyama_se3(
+                    est_pts[i0:i1], ref_pts[i0:i1]
+                )
+            except ValueError as error:
+                rospy.logwarn("Skip Umeyama for %s: %s", traj["label"], error)
+                continue
+            traj["positions"] = np.ascontiguousarray(
+                (traj["positions"] @ rotation.T) + translation
             )
-            traj["positions"] = np.ascontiguousarray(aligned)
+            yaw = math.degrees(math.atan2(rotation[1, 0], rotation[0, 0]))
             rospy.loginfo(
-                "Aligned %s to %s: start dxy=[%.4f, %.4f] m, dyaw=%.3f deg",
+                "Aligned %s to %s: Umeyama yaw=%.3f deg, "
+                "t=[%.3f, %.3f, %.3f] m, window=%d pairs",
                 traj["label"],
                 main["label"],
-                float(ref_position[0] - src_position[0]),
-                float(ref_position[1] - src_position[1]),
-                math.degrees(delta_yaw),
+                yaw,
+                float(translation[0]),
+                float(translation[1]),
+                float(translation[2]),
+                i1 - i0,
             )
         return trajectories
 
@@ -2289,7 +2732,10 @@ class TrajMonitor:
 
     def _draw_trajectories(self, axis):
         lines = []
+        live_axis = getattr(self, "axis", None)
         for index, traj in enumerate(self._draw_order_trajectories()):
+            if axis is not live_axis and not traj.get("visible", True):
+                continue
             (line,) = axis.plot(
                 traj["positions"][:, 0],
                 traj["positions"][:, 1],
@@ -2299,11 +2745,15 @@ class TrajMonitor:
                 zorder=5 + index,
                 label=traj["label"],
             )
+            if axis is live_axis:
+                traj["mpl_line"] = line
+                line.set_visible(traj.get("visible", True))
             lines.append(line)
         return lines
 
     def _draw_legend(self, axis, figure=None):
-        if not self.trajectories:
+        visible = self._visible_trajectories()
+        if not visible and self.start_xy is None:
             return None
         scale = self._ui_scale(axis.figure if figure is None else figure)
         handles = [
@@ -2315,7 +2765,7 @@ class TrajMonitor:
                 linewidth=max(traj["linewidth"] * scale, 1.5),
                 label=traj["label"],
             )
-            for traj in self.trajectories
+            for traj in visible
         ]
         if self.start_xy is not None:
             handles.append(
@@ -2396,6 +2846,7 @@ class TrajMonitor:
         self._set_plot_title()
         self._set_axis_extent(bev["extent"])
         self._interaction_overlay.raise_()
+        self._raise_toolbar_dropdowns()
         self._interaction_overlay.update()
 
     def _log_bev_info(self, label, bev):

@@ -135,7 +135,7 @@ src/data_monitor/scripts/bev.sh
 - 其它轨迹会按 benchmark 起点位置和起步约 10 m 的行驶方向做 SE(2) 对齐；TUM 文件开头 `t=0` 的占位位姿会跳过
 - 对齐后的起点用黄色小三角标出，图例中标注为 `start`
 - 图例放在图内右上角，随窗口缩放
-- 缩放、平移、分辨率、`Rebuild BEV`、`Save PNG` / `Save TIFF` 与 `pcd_monitor` 相同
+- 缩放、平移、分辨率、`Filter`、`Color`、`Rebuild BEV`、`Save PNG` / `Save TIFF` 与 `pcd_monitor` 相同；`Filter` 可勾选要显示的轨迹，`Color` 可改每条轨迹的颜色（色值或调色盘）
 
 运行：
 
