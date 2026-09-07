@@ -216,6 +216,7 @@ class TrajMonitor:
         self._drag_state = None
         self._overlay_view_limits = None
         self._interaction_active = False
+        self._overlay_paint_scheduled = False
         self._create_figure()
 
     def _create_figure(self):
@@ -1337,7 +1338,21 @@ class TrajMonitor:
                 self.hide()
 
             def paintEvent(self, _event):
+                monitor._overlay_paint_scheduled = False
                 painter = QtGui.QPainter(self)
+                render_hints = getattr(
+                    QtGui.QPainter,
+                    "RenderHint",
+                    QtGui.QPainter,
+                )
+                painter.setRenderHint(
+                    getattr(render_hints, "Antialiasing"),
+                    False,
+                )
+                painter.setRenderHint(
+                    getattr(render_hints, "SmoothPixmapTransform"),
+                    False,
+                )
                 monitor._paint_interaction_overlay(painter, self)
                 painter.end()
 
@@ -1347,7 +1362,22 @@ class TrajMonitor:
             self.figure.canvas
         )
         self._interaction_data_rect = QtCore.QRectF()
-        self._trajectory_qitems = self._build_trajectory_qitems()
+        self._overlay_polygon = QtGui.QPolygonF()
+        self._prepare_overlay_trajectories()
+        self._overlay_tick_font = QtGui.QFont()
+        self._overlay_tick_font.setPointSizeF(self.AXIS_TICK_FONTSIZE)
+        self._overlay_tick_font.setBold(True)
+        self._overlay_tick_metrics = QtGui.QFontMetricsF(
+            self._overlay_tick_font
+        )
+        self._overlay_offset_font = QtGui.QFont(self._overlay_tick_font)
+        self._overlay_offset_font.setPointSizeF(self.AXIS_OFFSET_FONTSIZE)
+        self._overlay_label_font = QtGui.QFont()
+        self._overlay_label_font.setPointSizeF(self.AXIS_LABEL_FONTSIZE)
+        self._overlay_label_font.setBold(True)
+        self._overlay_title_font = QtGui.QFont()
+        self._overlay_title_font.setPointSizeF(14.0)
+        self._overlay_title_font.setBold(False)
 
         alignments = getattr(
             QtCore.Qt,
@@ -1434,15 +1464,6 @@ class TrajMonitor:
         painter.fillRect(
             data_rect,
             self._qt_gui.QColor(self.PLOT_EMPTY_COLOR),
-        )
-        render_hints = getattr(
-            self._qt_gui.QPainter,
-            "RenderHint",
-            self._qt_gui.QPainter,
-        )
-        painter.setRenderHint(
-            getattr(render_hints, "SmoothPixmapTransform"),
-            False,
         )
         self._draw_cached_bev_image(painter, data_rect)
         (view_min_x, view_max_x), (view_min_y, view_max_y) = (
@@ -1531,7 +1552,11 @@ class TrajMonitor:
             / image_height
             * pixmap.height(),
         )
-        painter.drawPixmap(target_rect, pixmap, source_rect)
+        target = target_rect.toAlignedRect()
+        source = source_rect.toAlignedRect()
+        if target.isEmpty() or source.isEmpty():
+            return
+        painter.drawPixmap(target, pixmap, source)
 
     def _bev_qpixmap(self, bev):
         cached_pixmap = bev.get("qt_pixmap")
@@ -1631,55 +1656,124 @@ class TrajMonitor:
                 )
         painter.restore()
 
-    def _positions_to_qpath(self, positions):
-        path = self._qt_gui.QPainterPath()
-        path_started = False
-        for x_value, y_value in positions[:, :2]:
-            if not math.isfinite(x_value) or not math.isfinite(y_value):
-                path_started = False
-                continue
-            if path_started:
-                path.lineTo(float(x_value), float(y_value))
-            else:
-                path.moveTo(float(x_value), float(y_value))
-                path_started = True
-        return path
+    def _prepare_overlay_trajectories(self):
+        for traj in self.trajectories:
+            traj["overlay_xy"] = np.ascontiguousarray(
+                traj["positions"][:, :2],
+                dtype=np.float64,
+            )
 
-    def _build_trajectory_qitems(self):
-        return [
-            (self._positions_to_qpath(traj["positions"]), traj)
-            for traj in self._draw_order_trajectories()
-        ]
+    def _overlay_xy(self, traj):
+        xy = traj.get("overlay_xy")
+        positions = traj["positions"]
+        if xy is None or xy.shape[0] != positions.shape[0]:
+            xy = np.ascontiguousarray(positions[:, :2], dtype=np.float64)
+            traj["overlay_xy"] = xy
+        return xy
+
+    @staticmethod
+    def _visible_polyline_runs(xs, ys, xmin, xmax, ymin, ymax):
+        n = xs.size
+        if n < 2:
+            return
+        finite = np.isfinite(xs) & np.isfinite(ys)
+        inside = (
+            finite
+            & (xs >= xmin)
+            & (xs <= xmax)
+            & (ys >= ymin)
+            & (ys <= ymax)
+        )
+        keep = inside.copy()
+        keep[1:] |= inside[:-1] & finite[1:]
+        keep[:-1] |= inside[1:] & finite[:-1]
+        keep &= finite
+        if not keep.any():
+            return
+        padded = np.empty(n + 2, dtype=np.int8)
+        padded[0] = 0
+        padded[-1] = 0
+        padded[1:-1] = keep.astype(np.int8)
+        edges = np.diff(padded)
+        starts = np.flatnonzero(edges == 1)
+        ends = np.flatnonzero(edges == -1)
+        for start, end in zip(starts, ends):
+            if end - start >= 2:
+                yield start, end
+
+    @staticmethod
+    def _pixel_unique_mask(px, py, pixel_step=1.0):
+        if px.size <= 2:
+            return np.ones(px.size, dtype=bool)
+        if pixel_step <= 1.0:
+            ix = np.rint(px).astype(np.int32)
+            iy = np.rint(py).astype(np.int32)
+        else:
+            inv = 1.0 / pixel_step
+            ix = np.rint(px * inv).astype(np.int32)
+            iy = np.rint(py * inv).astype(np.int32)
+        mask = np.empty(px.size, dtype=bool)
+        mask[0] = True
+        mask[1:] = (ix[1:] != ix[:-1]) | (iy[1:] != iy[:-1])
+        mask[-1] = True
+        return mask
+
+    def _draw_pixel_polyline(self, painter, px, py):
+        count = int(px.size)
+        if count < 2:
+            return
+        polygon = self._overlay_polygon
+        polygon.clear()
+        reserve = getattr(polygon, "reserve", None)
+        if callable(reserve):
+            reserve(count)
+        qpoint = self._qt_core.QPointF
+        for x_value, y_value in zip(px.tolist(), py.tolist()):
+            polygon.append(qpoint(x_value, y_value))
+        painter.drawPolyline(polygon)
 
     def _draw_interaction_trajectories(self, painter, data_rect):
-        if not self._trajectory_qitems:
+        trajectories = self._draw_order_trajectories()
+        if not trajectories:
             return
 
         (view_min_x, view_max_x), (view_min_y, view_max_y) = (
             self._current_view_limits()
         )
-        scale_x = data_rect.width() / (view_max_x - view_min_x)
-        scale_y = data_rect.height() / (view_max_y - view_min_y)
-        transform = self._qt_gui.QTransform(
-            scale_x,
-            0.0,
-            0.0,
-            -scale_y,
-            data_rect.left() - scale_x * view_min_x,
-            data_rect.top() + scale_y * view_max_y,
-        )
+        view_width = view_max_x - view_min_x
+        view_height = view_max_y - view_min_y
+        pixel_width = data_rect.width()
+        pixel_height = data_rect.height()
+        if view_width <= 0.0 or view_height <= 0.0:
+            return
+        if pixel_width <= 0.0 or pixel_height <= 0.0:
+            return
+
+        pad_x = max(view_width * 0.04, view_width / pixel_width * 8.0)
+        pad_y = max(view_height * 0.04, view_height / pixel_height * 8.0)
+        xmin = view_min_x - pad_x
+        xmax = view_max_x + pad_x
+        ymin = view_min_y - pad_y
+        ymax = view_max_y + pad_y
+        left = data_rect.left()
+        bottom = data_rect.bottom()
+        scale_x = pixel_width / view_width
+        scale_y = pixel_height / view_height
         pen_styles = getattr(
             self._qt_core.Qt,
             "PenStyle",
             self._qt_core.Qt,
         )
         interacting = bool(self._interaction_active or self._drag_state)
+        pixel_step = 2.0 if interacting else 1.0
         painter.save()
         painter.setClipRect(data_rect)
-        painter.setTransform(transform, True)
-        for qpath, traj in self._trajectory_qitems:
+        for traj in trajectories:
             if not traj.get("visible", True):
                 continue
+            xy = self._overlay_xy(traj)
+            xs = xy[:, 0]
+            ys = xy[:, 1]
             trajectory_pen = self._qt_gui.QPen(
                 self._qt_gui.QColor(traj["color"])
             )
@@ -1690,7 +1784,20 @@ class TrajMonitor:
             else:
                 trajectory_pen.setStyle(getattr(pen_styles, "DashLine"))
             painter.setPen(trajectory_pen)
-            painter.drawPath(qpath)
+            for start, end in self._visible_polyline_runs(
+                xs,
+                ys,
+                xmin,
+                xmax,
+                ymin,
+                ymax,
+            ):
+                run_x = xs[start:end]
+                run_y = ys[start:end]
+                px = left + (run_x - view_min_x) * scale_x
+                py = bottom - (run_y - view_min_y) * scale_y
+                mask = self._pixel_unique_mask(px, py, pixel_step)
+                self._draw_pixel_polyline(painter, px[mask], py[mask])
         painter.restore()
 
     def _triangle_path(self, center, radius):
@@ -1746,17 +1853,18 @@ class TrajMonitor:
         )
         painter.save()
         painter.setClipRect(data_rect)
-        painter.setRenderHint(
-            getattr(
+        if not (self._interaction_active or self._drag_state):
+            painter.setRenderHint(
                 getattr(
-                    self._qt_gui.QPainter,
-                    "RenderHint",
-                    self._qt_gui.QPainter,
+                    getattr(
+                        self._qt_gui.QPainter,
+                        "RenderHint",
+                        self._qt_gui.QPainter,
+                    ),
+                    "Antialiasing",
                 ),
-                "Antialiasing",
-            ),
-            True,
-        )
+                True,
+            )
         painter.setPen(getattr(pen_styles, "NoPen"))
         painter.setBrush(fill)
         painter.drawPath(self._triangle_path(center, radius))
@@ -1909,17 +2017,18 @@ class TrajMonitor:
         y_labels,
         y_offset,
     ):
-        painter.setRenderHint(
-            getattr(
+        if not (self._interaction_active or self._drag_state):
+            painter.setRenderHint(
                 getattr(
-                    self._qt_gui.QPainter,
-                    "RenderHint",
-                    self._qt_gui.QPainter,
+                    getattr(
+                        self._qt_gui.QPainter,
+                        "RenderHint",
+                        self._qt_gui.QPainter,
+                    ),
+                    "TextAntialiasing",
                 ),
-                "TextAntialiasing",
-            ),
-            True,
-        )
+                True,
+            )
         border_pen = self._qt_gui.QPen(
             self._qt_gui.QColor(self.UI_BORDER)
         )
@@ -1933,12 +2042,10 @@ class TrajMonitor:
         painter.setBrush(getattr(brush_styles, "NoBrush"))
         painter.drawRect(data_rect)
 
-        tick_font = self._qt_gui.QFont()
-        tick_font.setPointSizeF(self.AXIS_TICK_FONTSIZE)
-        tick_font.setBold(True)
+        tick_font = self._overlay_tick_font
+        tick_metrics = self._overlay_tick_metrics
         painter.setFont(tick_font)
         painter.setPen(self._qt_gui.QColor(self.UI_MUTED_TEXT))
-        tick_metrics = self._qt_gui.QFontMetricsF(tick_font)
         tick_length = 4.0
         (view_min_x, view_max_x), (view_min_y, view_max_y) = (
             self._current_view_limits()
@@ -1999,10 +2106,7 @@ class TrajMonitor:
                 label,
             )
 
-        offset_font = self._qt_gui.QFont(tick_font)
-        offset_font.setPointSizeF(self.AXIS_OFFSET_FONTSIZE)
-        offset_font.setBold(True)
-        painter.setFont(offset_font)
+        painter.setFont(self._overlay_offset_font)
         if x_offset:
             painter.drawText(
                 self._qt_core.QRectF(
@@ -2026,10 +2130,7 @@ class TrajMonitor:
                 y_offset,
             )
 
-        label_font = self._qt_gui.QFont()
-        label_font.setPointSizeF(self.AXIS_LABEL_FONTSIZE)
-        label_font.setBold(True)
-        painter.setFont(label_font)
+        painter.setFont(self._overlay_label_font)
         painter.setPen(self._qt_gui.QColor("#475569"))
         painter.drawText(
             self._qt_core.QRectF(
@@ -2059,10 +2160,7 @@ class TrajMonitor:
         )
         painter.restore()
 
-        title_font = self._qt_gui.QFont()
-        title_font.setPointSizeF(14.0)
-        title_font.setBold(False)
-        painter.setFont(title_font)
+        painter.setFont(self._overlay_title_font)
         painter.setPen(self._qt_gui.QColor(self.UI_TEXT))
         title_gap = (
             self.TITLE_PAD_POINTS
@@ -2103,6 +2201,7 @@ class TrajMonitor:
         self._interaction_restore_timer.stop()
         self._bev_qpixmap(self.bev)
         self._interaction_active = True
+        self._overlay_paint_scheduled = True
         self._interaction_overlay.update()
 
     def _show_persistent_overlay(self):
@@ -2116,6 +2215,10 @@ class TrajMonitor:
     def _update_interaction_overlay(self):
         if not self._interaction_active:
             self._begin_interaction()
+            return
+        if self._overlay_paint_scheduled:
+            return
+        self._overlay_paint_scheduled = True
         self._interaction_overlay.update()
 
     def _schedule_interaction_finish(self):
@@ -2135,13 +2238,13 @@ class TrajMonitor:
         self._interaction_restore_timer.stop()
         self._commit_overlay_view()
         self._interaction_active = False
-        if draw:
-            # Synchronize Matplotlib behind the persistent Qt plot layer.
-            # The screen never switches renderers when interaction ends.
-            self._raw_canvas_draw()
+        # Overlay is the on-screen renderer. Do not stall the last drag/zoom
+        # frame with a full Matplotlib redraw; limits are already committed
+        # for export, and resize/rebuild will refresh the hidden canvas.
         self._interaction_overlay.raise_()
         self._raise_toolbar_dropdowns()
-        self._interaction_overlay.update()
+        if draw:
+            self._interaction_overlay.update()
         return True
 
     def _cancel_interaction(self):
