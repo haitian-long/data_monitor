@@ -2632,7 +2632,14 @@ class TrajMonitor:
         self._set_trajectory_color(traj, color_text, editor, swatch)
         self._style_color_swatch(swatch, color_text, selected=True)
 
-    def _order_trajectories(self, trajectories):
+    @staticmethod
+    def _other_sort_key(traj):
+        label = str(traj.get("label") or "").strip()
+        if not label:
+            label = str(traj.get("path") or "")
+        return label.casefold()
+
+    def _partition_trajectories(self, trajectories):
         mains = [traj for traj in trajectories if traj["is_main"]]
         ours = [
             traj
@@ -2644,21 +2651,23 @@ class TrajMonitor:
             for traj in trajectories
             if not traj["is_main"] and not self._is_ours_loaded(traj)
         ]
+        others.sort(key=self._other_sort_key)
+        return mains, others, ours
+
+    def _order_trajectories(self, trajectories):
+        mains, others, ours = self._partition_trajectories(trajectories)
         return mains + others + ours
 
     def _draw_order_trajectories(self):
-        mains = [traj for traj in self.trajectories if traj["is_main"]]
-        ours = [
-            traj
-            for traj in self.trajectories
-            if not traj["is_main"] and self._is_ours_loaded(traj)
-        ]
-        others = [
-            traj
-            for traj in self.trajectories
-            if not traj["is_main"] and not self._is_ours_loaded(traj)
-        ]
+        mains, others, ours = self._partition_trajectories(self.trajectories)
         return others + ours + mains
+
+    def _assign_other_palette_colors(self, trajectories):
+        _, others, _ = self._partition_trajectories(trajectories)
+        palette = self.OTHER_TRAJECTORY_COLORS
+        for index, traj in enumerate(others):
+            traj["color"] = palette[index % len(palette)]
+        return trajectories
 
     def _load_trajectories(self):
         trajectories = []
@@ -2715,6 +2724,7 @@ class TrajMonitor:
                 trajectories.append(trajectory)
         trajectories = self._align_other_trajectories(trajectories)
         trajectories = self._order_trajectories(trajectories)
+        trajectories = self._assign_other_palette_colors(trajectories)
         self.start_xy = self._trajectory_start_xy(trajectories)
         return trajectories
 

@@ -9,7 +9,7 @@ OURS_ALGO="ours"
 # Optional legend overrides for remaining algorithms only.
 # Unlisted names stay as the TUM suffix (e.g. fast_lio2). Avoid commas.
 declare -A LEGEND_NAMES=(
-  # [fast_lio2]="FAST-LIO2"
+  [good]="dlio"
   # [kiss_icp]="KISS-ICP"
 )
 # ====================================
